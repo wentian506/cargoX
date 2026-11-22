@@ -22,6 +22,7 @@ from .core.config import settings
 
 _lock = threading.RLock()
 _state: dict[str, Any] = {"conn": None, "dialect": "sqlite"}
+_col_cache: dict[tuple[str, str], set[str]] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -72,6 +73,30 @@ def _pg_rollback(conn: Any) -> None:
             conn.rollback()
         except Exception:
             pass
+
+
+def _table_columns(table: str) -> set[str] | None:
+    d = _state["dialect"]
+    key = (d, table)
+    if key in _col_cache:
+        return _col_cache[key]
+    if d == "postgres":
+        rows = q(
+            "select column_name from information_schema.columns "
+            "where table_schema = 'public' and table_name = ?",
+            (table,),
+        )
+        cols = {r["column_name"] for r in rows}
+        if cols:
+            _col_cache[key] = cols
+            return cols
+        return None
+    rows = q(f"pragma table_info({table})")
+    cols = {r["name"] for r in rows if "name" in r}
+    if cols:
+        _col_cache[key] = cols
+        return cols
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -135,14 +160,19 @@ def execute(query: str, params: Sequence[Any] | None = None) -> int:
 
 
 def insert(table: str, data: dict) -> dict:
-    cols = list(data.keys())
+    connect()
+    known_cols = _table_columns(table)
+    filtered = {k: v for k, v in data.items() if not known_cols or k in known_cols}
+    if not filtered:
+        filtered = dict(data)
+    cols = list(filtered.keys())
     ph = ", ".join("?" for _ in cols)
     query = f"insert into {table} ({', '.join(cols)}) values ({ph})"
     if _state["dialect"] == "postgres":
-        rows = q(query + " returning *", list(data.values()))
-        return rows[0]
-    execute(query, [data[c] for c in cols])
-    return data
+        rows = q(query + " returning *", [filtered[c] for c in cols])
+        return rows[0] if rows else filtered
+    execute(query, [filtered[c] for c in cols])
+    return filtered
 
 
 def executemany(query: str, seq: Iterable[Sequence[Any]]) -> None:
