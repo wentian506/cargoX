@@ -462,7 +462,7 @@ create index if not exists ix_audit_entity on audit_logs(entity_type, entity_id)
 -- ---------------------------------------------------------------------------
 create table if not exists gps_pings (
   id text primary key,
-  trip_id text not null references trips(id) on delete cascade,
+  trip_id uuid not null references trips(id) on delete cascade,
   lat real not null,
   lng real not null,
   heading real,
@@ -491,7 +491,7 @@ create table if not exists tracking_subscriptions (
   phone text not null,
   channel text not null default 'sms',          -- sms | whatsapp (delivery needs a provider key)
   shipment_id text references shipments(id) on delete cascade,
-  trip_id text references trips(id) on delete cascade,
+  trip_id uuid references trips(id) on delete cascade,
   created_at text not null
 );
 
