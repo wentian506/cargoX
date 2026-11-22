@@ -110,8 +110,11 @@ def run() -> dict:
         ("ORG-RETAIL-PAY", "Payal Agri Retail", ORG_KIND, "Punjab", "Fatehgarh Sahib", None),
     ]
     for o in orgs:
+        org_uuid = _uuid_id(o[0])
+        if db.scalar("select count(*) from organisations where id = ?", (org_uuid,), 0):
+            continue
         db.insert("organisations", {
-            "id": _uuid_id(o[0]),
+            "id": org_uuid,
             "name": o[1],
             "kind": o[2],
             "state": o[3],
