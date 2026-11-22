@@ -21,7 +21,17 @@ LIVE = datetime.now(timezone.utc)   # live rows anchor here so the register alwa
 
 
 def uid(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{prefix}_{uuid.uuid4().hex[:12]}"))
+
+
+def _uuid_id(val: str | None) -> str | None:
+    if val is None:
+        return None
+    s = str(val)
+    try:
+        return str(uuid.UUID(s))
+    except (ValueError, TypeError):
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, s))
 
 
 def iso(d: datetime | date | None = None) -> str:
@@ -64,7 +74,6 @@ MANDIS = [
 ]
 
 MARKET_PRICES = {
-    # commodity: {mandi: (min, mode, max) INR per quintal}
     "wheat": {"M-GOB": (2230, 2285, 2350), "M-KHN": (2210, 2270, 2330), "M-LDH": (2200, 2255, 2310),
               "M-JAG": (2180, 2240, 2300), "M-RAI": (2170, 2230, 2290)},
     "paddy": {"M-GOB": (2280, 2330, 2400), "M-KHN": (2270, 2320, 2385), "M-LDH": (2255, 2305, 2370),
@@ -85,7 +94,7 @@ CROP_CLUSTERS = [
 ]
 
 
-ADMIN_ID = "USR-OWNER"
+ADMIN_ID = _uuid_id("USR-OWNER") or "USR-OWNER"
 
 
 def run() -> dict:
@@ -99,38 +108,26 @@ def run() -> dict:
         ("ORG-RETAIL-PAY", "Payal Agri Retail", "business"),
     ]
     for o in orgs:
-        db.insert("organisations", {"id": o[0], "name": o[1], "kind": o[2], "created_at": now})
+        db.insert("organisations", {"id": _uuid_id(o[0]), "name": o[1], "kind": o[2], "created_at": now})
 
-    # ---------------------------------------------------------------- users --
-    # Only the owner admin is seeded. Sender and transporter accounts are created
-    # by their own owners through Register or Sign in with Google — there are no
-    # demo logins left in the product (see docs/admin-access.md).
-    # --- owner admin(s) ---------------------------------------------------- #
-    # CARGOX_ADMIN_EMAILS (default: the product owner's Gmail) always get an
-    # Admin profile on a fresh database. They can sign in with Google (linked on
-    # first sign-in) or with CARGOX_ADMIN_PASSWORD. There is no other admin.
     from .core.config import settings as _settings
     global ADMIN_ID
     for i, email in enumerate(_settings.ADMIN_EMAILS, start=1):
         if db.scalar("select count(*) from profiles where lower(email) = ?", (email,), 0):
             continue
-        pid = "USR-OWNER" if i == 1 else f"USR-OWNER-{i}"
-        if i == 1:
+        raw_pid = "USR-OWNER" if i == 1 else f"USR-OWNER-{i}"
+        pid = _uuid_id(raw_pid)
+        if i == 1 and pid:
             ADMIN_ID = pid
         db.insert("profiles", {
             "id": pid, "email": email, "mobile": None,
-            # CARGOX_ADMIN_PASSWORD (default "mehak@2006"): the owner can enter with
-            # email + password, or with "Sign in with Google" on the same Gmail.
             "password_hash": hash_password(_settings.ADMIN_PASSWORD, 20000),
             "role": "admin", "full_name": _settings.ADMIN_NAME,
             "state": "Punjab", "district": "Ludhiana", "language": "en",
-            "org_id": "ORG-CARGOX", "status": "active", "verified_at": now,
+            "org_id": _uuid_id("ORG-CARGOX"), "status": "active", "verified_at": now,
             "created_at": now, "auth_provider": "google",
         })
 
-    # The synthetic register still needs parties to belong to. These are DATA
-    # OWNERS, not login accounts: password_hash is NULL, so login() rejects them
-    # and no credentials for them exist anywhere in the product or the docs.
     for pid, email, role, name, state, district in [
         ("USR-SND-01", "register.party1@cargox.invalid", "sender", "Bhari Farmer Group", "Punjab", "Ludhiana"),
         ("USR-SND-02", "register.party2@cargox.invalid", "sender", "Isewal Farmer Group", "Punjab", "Ludhiana"),
@@ -140,7 +137,7 @@ def run() -> dict:
         ("USR-TRN-03", "register.party6@cargox.invalid", "transporter", "Sahnewal Tempo Service", "Punjab", "Ludhiana"),
     ]:
         db.insert("profiles", {
-            "id": pid, "email": email, "mobile": None, "password_hash": None,
+            "id": _uuid_id(pid), "email": email, "mobile": None, "password_hash": None,
             "role": role, "full_name": name, "state": state, "district": district,
             "language": "en", "org_id": None, "status": "active",
             "verified_at": now, "created_at": now,
@@ -150,15 +147,20 @@ def run() -> dict:
         ("USR-SND-01", "farmer", "Bhari"), ("USR-SND-02", "farmer", "Isewal"),
         ("USR-SND-03", "shipper", "Sahnewal"),
     ]:
-        db.insert("sender_profiles", {"profile_id": pid, "account_kind": kind, "village": village, "created_at": now})
+        db.insert("sender_profiles", {
+            "profile_id": _uuid_id(pid), "account_kind": kind,
+            "village": village, "created_at": now,
+        })
 
     for pid, company, fleet, ver in [
         ("USR-TRN-01", "Khanna Fleet Cooperative", 3, "verified"),
         ("USR-TRN-02", "Payal Rural Transport", 3, "verified"),
         ("USR-TRN-03", "Sahnewal Tempo Service", 2, "pending"),
     ]:
-        db.insert("transporter_profiles", {"profile_id": pid, "company_name": company, "fleet_size": fleet,
-                                           "verification_status": ver, "rating": 4.4, "created_at": now})
+        db.insert("transporter_profiles", {
+            "profile_id": _uuid_id(pid), "company_name": company, "fleet_size": fleet,
+            "verification_status": ver, "rating": 4.4, "created_at": now,
+        })
 
     vehicles = [
         ("VEH-01", "USR-TRN-01", "PB10AB1234", "tractor_trolley", 2500, 9.0, 24.0, True),
@@ -171,31 +173,40 @@ def run() -> dict:
     ]
     for vid, tid, reg, klass, payload, vol, cpk, verified in vehicles:
         db.insert("vehicles", {
-            "id": vid, "transporter_id": tid, "reg_no": reg, "vehicle_class": klass,
-            "payload_kg": payload, "volume_m3": vol, "body_type": "open", "fuel": "diesel",
+            "id": _uuid_id(vid), "transporter_id": _uuid_id(tid), "reg_no": reg,
+            "vehicle_class": klass, "payload_kg": payload, "volume_m3": vol,
+            "body_type": "open", "fuel": "diesel",
             "operating_districts": "Ludhiana,Fatehgarh Sahib", "availability": "available",
             "cost_per_km": cpk, "verified": verified, "verified_at": now if verified else None,
             "created_at": now,
         })
-        db.insert("vehicle_documents", {"id": uid("DOC"), "vehicle_id": vid, "doc_type": "rc",
-                                        "doc_ref": f"storage://vehicle-docs/{vid}-rc.pdf",
-                                        "verified": verified, "uploaded_at": now})
+        db.insert("vehicle_documents", {
+            "id": uid("DOC"), "vehicle_id": _uuid_id(vid), "doc_type": "rc",
+            "doc_ref": f"storage://vehicle-docs/{vid}-rc.pdf",
+            "verified": verified, "uploaded_at": now,
+        })
 
     for vid, name, district, lat, lng, cluster in VILLAGES:
-        db.insert("villages", {"id": vid, "name": name, "district": district, "state": "Punjab",
-                               "lat": lat, "lng": lng, "cluster_id": cluster,
-                               "road_verified_at": iso(NOW - timedelta(days=95))})
+        db.insert("villages", {
+            "id": _uuid_id(vid), "name": name, "district": district, "state": "Punjab",
+            "lat": lat, "lng": lng, "cluster_id": cluster,
+            "road_verified_at": iso(NOW - timedelta(days=95)),
+        })
 
     for hid, name, district, htype, lat, lng, safe, window, cap in HUBS:
-        db.insert("hubs", {"id": hid, "name": name, "district": district, "hub_type": htype,
-                           "lat": lat, "lng": lng, "safety_verified": safe,
-                           "partner_id": "ORG-FPO-KHN" if safe else None,
-                           "operating_window": window, "capacity_kg": cap})
+        db.insert("hubs", {
+            "id": _uuid_id(hid), "name": name, "district": district, "hub_type": htype,
+            "lat": lat, "lng": lng, "safety_verified": safe,
+            "partner_id": _uuid_id("ORG-FPO-KHN") if safe else None,
+            "operating_window": window, "capacity_kg": cap,
+        })
 
     for mid, name, district, lat, lng, q in MANDIS:
-        db.insert("mandis", {"id": mid, "name": name, "district": district, "lat": lat, "lng": lng, "queue_minutes": q})
+        db.insert("mandis", {
+            "id": _uuid_id(mid), "name": name, "district": district,
+            "lat": lat, "lng": lng, "queue_minutes": q,
+        })
 
-    # road graph: village <-> hub <-> mandi with realistic surfaces
     edges = []
     def edge(a, b, surface, width, risk):
         edges.append((f"RE-{len(edges)+1:03d}", a, b, surface, width, risk))
@@ -219,20 +230,25 @@ def run() -> dict:
     edge("H-MLG-01", "M-LDH", "paved", 9.0, 0.06)
     edge("M-JAG", "M-RAI", "gravel", 4.6, 0.34)
     for eid, a, b, surface, width, risk in edges:
-        db.insert("road_edges", {"id": eid, "from_node": a, "to_node": b,
-                                 "distance_km": round(_dist(a, b), 2), "surface": surface,
-                                 "width_m": width, "monsoon_risk": risk,
-                                 "vehicle_class_access": "tractor_trolley,pickup" + (",tempo,lcv,truck" if width >= 5 and surface == "paved" else (",tempo,lcv" if surface == "gravel" else "")),
-                                 "verified_at": iso(NOW - timedelta(days=95))})
+        db.insert("road_edges", {
+            "id": _uuid_id(eid), "from_node": a, "to_node": b,
+            "distance_km": round(_dist(a, b), 2), "surface": surface,
+            "width_m": width, "monsoon_risk": risk,
+            "vehicle_class_access": (
+                "tractor_trolley,pickup"
+                + (",tempo,lcv,truck" if width >= 5 and surface == "paved"
+                   else (",tempo,lcv" if surface == "gravel" else ""))
+            ),
+            "verified_at": iso(NOW - timedelta(days=95)),
+        })
 
-    # market observations — 10 days history
     for commodity, mandi_prices in MARKET_PRICES.items():
         for mid, (mn, mode, mx) in mandi_prices.items():
             for d in range(10):
                 day = NOW.date() - timedelta(days=d)
                 drift = 1 + 0.004 * math.sin(d + hash(commodity) % 7)
                 db.insert("market_observations", {
-                    "id": uid("MKT"), "commodity_id": commodity, "mandi_id": mid,
+                    "id": uid("MKT"), "commodity_id": commodity, "mandi_id": _uuid_id(mid),
                     "obs_date": day.isoformat(),
                     "price_min": round(mn * drift, 0), "price_mode": round(mode * drift, 0),
                     "price_max": round(mx * drift, 0),
@@ -241,10 +257,11 @@ def run() -> dict:
                 })
 
     for mid, name, district, lat, lng, q in MANDIS:
-        db.insert("mandi_queues", {"id": uid("MQ"), "mandi_id": mid, "observed_at": now,
-                                   "queue_minutes": q, "source": "simulated", "created_at": now})
+        db.insert("mandi_queues", {
+            "id": uid("MQ"), "mandi_id": _uuid_id(mid), "observed_at": now,
+            "queue_minutes": q, "source": "simulated", "created_at": now,
+        })
 
-    # capacity blocks published by transporters
     blocks = [
         ("CAP-001", "USR-TRN-01", "VEH-01", "tractor_trolley", 2500, 9.0, "ludhiana->fatehgarh sahib", 3, 1200, 22),
         ("CAP-002", "USR-TRN-01", "VEH-03", "lcv", 7500, 22.0, "ludhiana->fatehgarh sahib", 3, 2500, 31),
@@ -254,7 +271,8 @@ def run() -> dict:
     ]
     for cid, tid, vid, klass, payload, vol, corridor, days, size, price in blocks:
         db.insert("capacity_blocks", {
-            "id": cid, "transporter_id": tid, "vehicle_id": vid, "vehicle_class": klass,
+            "id": _uuid_id(cid), "transporter_id": _uuid_id(tid),
+            "vehicle_id": _uuid_id(vid), "vehicle_class": klass,
             "payload_kg": payload, "volume_m3": vol, "corridor": corridor,
             "window_from": iso(NOW), "window_to": iso(NOW + timedelta(days=days)),
             "block_size_kg": size, "min_run_km": 25, "reserve_price_per_km": price,
@@ -262,7 +280,6 @@ def run() -> dict:
             "status": "published", "created_at": now,
         })
 
-    # ------------------------------------------------------------ shipments --
     demo_shipments = [
         ("USR-SND-01", "wheat", 4800, "V-KHN-01", "Bhari", 30.8421, 76.1520, "M-GOB", "Mandi Gobindgarh", 30.67, 76.29, "pending_admin_review"),
         ("USR-SND-02", "wheat", 3200, "V-KHN-02", "Isewal", 30.8244, 76.1810, "M-GOB", "Mandi Gobindgarh", 30.67, 76.29, "pending_admin_review"),
@@ -274,13 +291,14 @@ def run() -> dict:
         ("USR-SND-02", "maize", 2800, "V-KHN-04", "Rohno Kalan", 30.8090, 76.1610, "M-KHN", "Khanna Mandi", 30.704, 76.223, "awaiting_sender_approval"),
     ]
     for i, (snd, crop, kg, vid, vname, lat, lng, dm, dname, dlat, dlng, status) in enumerate(demo_shipments):
-        sid = f"SHP-{1001 + i}"
+        sid = _uuid_id(f"SHP-{1001 + i}")
         ready = NOW + timedelta(hours=6 + i)
         db.insert("shipments", {
-            "id": sid, "code": f"CX-{2600 + i}", "sender_id": snd, "commodity": crop,
+            "id": sid, "code": f"CX-{2600 + i}", "sender_id": _uuid_id(snd), "commodity": crop,
             "quantity_kg": kg, "unit": "quintal", "pickup_village": vname,
             "pickup_district": "Ludhiana", "pickup_lat": lat, "pickup_lng": lng,
-            "destination_id": dm, "destination_name": dname, "dest_lat": dlat, "dest_lng": dlng,
+            "destination_id": _uuid_id(dm), "destination_name": dname,
+            "dest_lat": dlat, "dest_lng": dlng,
             "ready_from": iso(ready), "ready_to": iso(ready + timedelta(hours=4)),
             "deadline": iso(ready + timedelta(hours=14)),
             "packaging": "jute_bags" if crop in ("wheat", "paddy", "maize") else "crates",
@@ -291,32 +309,33 @@ def run() -> dict:
             "direction": "outbound", "is_synthetic": True,
             "created_at": iso(NOW - timedelta(days=2, hours=i)), "updated_at": now,
         })
-        db.insert("shipment_items", {"id": uid("ITM"), "shipment_id": sid, "commodity": crop,
-                                     "quantity_kg": kg, "packaging": "jute_bags", "handling": "dry_cover"})
-        db.insert("shipment_destinations", {"id": uid("DST"), "shipment_id": sid, "name": dname,
-                                            "kind": "mandi", "lat": dlat, "lng": dlng,
-                                            "expected_price": MARKET_PRICES.get(crop, MARKET_PRICES["wheat"])[dm][1],
-                                            "queue_minutes": 45, "preference_rank": 1})
+        db.insert("shipment_items", {
+            "id": uid("ITM"), "shipment_id": sid, "commodity": crop,
+            "quantity_kg": kg, "packaging": "jute_bags", "handling": "dry_cover",
+        })
+        db.insert("shipment_destinations", {
+            "id": uid("DST"), "shipment_id": sid, "name": dname,
+            "kind": "mandi", "lat": dlat, "lng": dlng,
+            "expected_price": MARKET_PRICES.get(crop, MARKET_PRICES["wheat"])[dm][1],
+            "queue_minutes": 45, "preference_rank": 1,
+        })
 
-    # ---------------------------------------------------- pooled coalition --
-    # A worked demonstration coalition on the Khanna -> Gobindgarh corridor.
-    # These are dedicated demonstration records (SHP-3001 / SHP-3002) so the
-    # workflow fixtures above stay untouched, and the Shapley shares are computed
-    # by the same algorithm the admin screen runs — not hard-coded numbers.
     from .algorithms import shapley as _shapley
 
-    POOL_ID, COAL_ID = "POOL-DEMO-01", "COAL-DEMO-01"
+    POOL_ID = _uuid_id("POOL-DEMO-01")
+    COAL_ID = _uuid_id("COAL-DEMO-01")
     demo_coalition = [
         ("SHP-3001", "CX-3101", "USR-SND-01", 3400, "V-KHN-01", "Bhari", 30.8421, 76.1520),
         ("SHP-3002", "CX-3102", "USR-SND-02", 2100, "V-KHN-02", "Isewal", 30.8244, 76.1810),
     ]
-    for sid, code, snd, kg, vid, vname, lat, lng in demo_coalition:
+    for raw_sid, code, snd, kg, vid, vname, lat, lng in demo_coalition:
+        sid = _uuid_id(raw_sid)
         ready = NOW + timedelta(hours=3)
         db.insert("shipments", {
-            "id": sid, "code": code, "sender_id": snd, "commodity": "wheat",
+            "id": sid, "code": code, "sender_id": _uuid_id(snd), "commodity": "wheat",
             "quantity_kg": kg, "unit": "quintal", "pickup_village": vname,
             "pickup_district": "Ludhiana", "pickup_lat": lat, "pickup_lng": lng,
-            "destination_id": "M-GOB", "destination_name": "Mandi Gobindgarh",
+            "destination_id": _uuid_id("M-GOB"), "destination_name": "Mandi Gobindgarh",
             "dest_lat": 30.67, "dest_lng": 76.29,
             "ready_from": iso(ready), "ready_to": iso(ready + timedelta(hours=4)),
             "deadline": iso(ready + timedelta(hours=12)),
@@ -325,13 +344,17 @@ def run() -> dict:
             "direction": "outbound", "is_synthetic": True, "pool_id": POOL_ID,
             "created_at": iso(NOW - timedelta(days=1, hours=6)), "updated_at": now,
         })
-        db.insert("shipment_items", {"id": uid("ITM"), "shipment_id": sid, "commodity": "wheat",
-                                     "quantity_kg": kg, "packaging": "jute_bags", "handling": "dry_cover"})
-        db.insert("shipment_destinations", {"id": uid("DST"), "shipment_id": sid,
-                                            "name": "Mandi Gobindgarh", "kind": "mandi",
-                                            "lat": 30.67, "lng": 76.29,
-                                            "expected_price": MARKET_PRICES["wheat"]["M-GOB"][1],
-                                            "queue_minutes": 55, "preference_rank": 1})
+        db.insert("shipment_items", {
+            "id": uid("ITM"), "shipment_id": sid, "commodity": "wheat",
+            "quantity_kg": kg, "packaging": "jute_bags", "handling": "dry_cover",
+        })
+        db.insert("shipment_destinations", {
+            "id": uid("DST"), "shipment_id": sid,
+            "name": "Mandi Gobindgarh", "kind": "mandi",
+            "lat": 30.67, "lng": 76.29,
+            "expected_price": MARKET_PRICES["wheat"]["M-GOB"][1],
+            "queue_minutes": 55, "preference_rank": 1,
+        })
 
     db.insert("shipment_pools", {
         "id": POOL_ID, "corridor": "Khanna cluster -> Mandi Gobindgarh", "status": "approved",
@@ -351,118 +374,150 @@ def run() -> dict:
         "created_at": iso(NOW - timedelta(days=1, hours=4)),
     })
     for row in _alloc["rows"]:
+        alloc_sid = _uuid_id(row["shipment_id"])
         db.insert("cost_allocations", {
-            "id": uid("ALLOC"), "coalition_id": COAL_ID, "shipment_id": row["shipment_id"],
+            "id": uid("ALLOC"), "coalition_id": COAL_ID, "shipment_id": alloc_sid,
             "standalone_cost": row["standalone_cost"], "allocated_share": row["allocated_share"],
             "detour_km": row["detour_contribution_km"], "saving": row["saving"],
             "participation_check": 1 if row["participation_ok"] else 0,
             "approval": "approved", "method": _alloc["method"],
             "created_at": iso(NOW - timedelta(days=1, hours=4)),
         })
-        db.execute("update shipments set coalition_id = ?, freight_estimate = ?, freight_approved = 1 where id = ?",
-                   (COAL_ID, row["allocated_share"], row["shipment_id"]))
+        db.execute(
+            "update shipments set coalition_id = ?, freight_estimate = ?, freight_approved = 1 where id = ?",
+            (COAL_ID, row["allocated_share"], alloc_sid),
+        )
 
-    # a live trip for the in-transit shipment
     db.insert("transport_assignments", {
-        "id": "ASG-001", "pool_id": None, "transporter_id": "USR-TRN-02", "vehicle_id": "VEH-05",
+        "id": _uuid_id("ASG-001"), "pool_id": None,
+        "transporter_id": _uuid_id("USR-TRN-02"), "vehicle_id": _uuid_id("VEH-05"),
         "status": "confirmed", "revenue": 4100, "distance_km": 38.4, "ready_check": "ready",
         "accepted_at": (LIVE - timedelta(minutes=55)).isoformat(),
         "created_at": iso(NOW - timedelta(days=1)), "updated_at": now,
     })
-    db.insert("trips", {"id": "TRIP-001", "assignment_id": "ASG-001", "trip_code": "CX-TRIP-4411",
-                        "status": "in_transit", "vehicle_id": "VEH-05", "driver_name": "Sukhwinder Singh",
-                        "started_at": (LIVE - timedelta(minutes=40)).isoformat(), "created_at": iso(NOW - timedelta(hours=2))})
-    db.insert("trip_legs", {"id": uid("LEG"), "trip_id": "TRIP-001", "leg_no": 1, "leg_type": "first_mile",
-                            "from_name": "Payal", "to_name": "Payal Cooperative Yard",
-                            "from_lat": 30.729, "from_lng": 76.062, "to_lat": 30.735, "to_lng": 76.07,
-                            "distance_km": 4.2, "eta_minutes": 25, "status": "done", "load_kg": 3100})
-    db.insert("trip_legs", {"id": uid("LEG"), "trip_id": "TRIP-001", "leg_no": 2, "leg_type": "line_haul",
-                            "from_name": "Payal Cooperative Yard", "to_name": "Ludhiana Grain Market",
-                            "from_lat": 30.735, "from_lng": 76.07, "to_lat": 30.912, "to_lng": 75.848,
-                            "distance_km": 34.2, "eta_minutes": 68, "status": "active", "load_kg": 3100})
+    db.insert("trips", {
+        "id": _uuid_id("TRIP-001"), "assignment_id": _uuid_id("ASG-001"),
+        "trip_code": "CX-TRIP-4411", "status": "in_transit",
+        "vehicle_id": _uuid_id("VEH-05"), "driver_name": "Sukhwinder Singh",
+        "started_at": (LIVE - timedelta(minutes=40)).isoformat(),
+        "created_at": iso(NOW - timedelta(hours=2)),
+    })
+    db.insert("trip_legs", {
+        "id": uid("LEG"), "trip_id": _uuid_id("TRIP-001"), "leg_no": 1, "leg_type": "first_mile",
+        "from_name": "Payal", "to_name": "Payal Cooperative Yard",
+        "from_lat": 30.729, "from_lng": 76.062, "to_lat": 30.735, "to_lng": 76.07,
+        "distance_km": 4.2, "eta_minutes": 25, "status": "done", "load_kg": 3100,
+    })
+    db.insert("trip_legs", {
+        "id": uid("LEG"), "trip_id": _uuid_id("TRIP-001"), "leg_no": 2, "leg_type": "line_haul",
+        "from_name": "Payal Cooperative Yard", "to_name": "Ludhiana Grain Market",
+        "from_lat": 30.735, "from_lng": 76.07, "to_lat": 30.912, "to_lng": 75.848,
+        "distance_km": 34.2, "eta_minutes": 68, "status": "active", "load_kg": 3100,
+    })
     for sid in ("SHP-1005", "SHP-3001", "SHP-3002"):
-        db.insert("trip_shipments", {"trip_id": "TRIP-001", "shipment_id": sid})
+        db.insert("trip_shipments", {
+            "trip_id": _uuid_id("TRIP-001"), "shipment_id": _uuid_id(sid),
+        })
 
-    # a second, completed trip owned by the primary data-owner fleet,
-    # so the transporter workspace shows real history rather than an empty shell
     db.insert("transport_assignments", {
-        "id": "ASG-002", "pool_id": "POOL-DEMO-01", "transporter_id": "USR-TRN-01", "vehicle_id": "VEH-03",
+        "id": _uuid_id("ASG-002"), "pool_id": POOL_ID,
+        "transporter_id": _uuid_id("USR-TRN-01"), "vehicle_id": _uuid_id("VEH-03"),
         "status": "completed", "revenue": 3980, "distance_km": 61.2, "ready_check": "ready",
         "accepted_at": iso(NOW - timedelta(days=2, hours=5)),
         "created_at": iso(NOW - timedelta(days=2, hours=4)), "updated_at": now,
     })
-    db.insert("trips", {"id": "TRIP-002", "assignment_id": "ASG-002", "trip_code": "CX-TRIP-7788",
-                        "status": "delivered", "vehicle_id": "VEH-03", "driver_name": "Sukhwinder Singh",
-                        "started_at": iso(NOW - timedelta(days=2, hours=3)),
-                        "finished_at": iso(NOW - timedelta(days=2)),
-                        "created_at": iso(NOW - timedelta(days=2, hours=4))})
+    db.insert("trips", {
+        "id": _uuid_id("TRIP-002"), "assignment_id": _uuid_id("ASG-002"),
+        "trip_code": "CX-TRIP-7788", "status": "delivered",
+        "vehicle_id": _uuid_id("VEH-03"), "driver_name": "Sukhwinder Singh",
+        "started_at": iso(NOW - timedelta(days=2, hours=3)),
+        "finished_at": iso(NOW - timedelta(days=2)),
+        "created_at": iso(NOW - timedelta(days=2, hours=4)),
+    })
     for leg_no, leg_type, frm, to, flat, flng, tlat, tlng, km, eta, status in [
         (1, "first_mile", "Bhari", "Khanna Rural Hub (FPO yard)", 30.8421, 76.1520, 30.706, 76.216, 18.4, 42, "done"),
         (2, "line_haul", "Khanna Rural Hub (FPO yard)", "Mandi Gobindgarh", 30.706, 76.216, 30.67, 76.29, 42.8, 95, "done"),
     ]:
-        db.insert("trip_legs", {"id": uid("LEG"), "trip_id": "TRIP-002", "leg_no": leg_no, "leg_type": leg_type,
-                                "from_name": frm, "to_name": to, "from_lat": flat, "from_lng": flng,
-                                "to_lat": tlat, "to_lng": tlng, "distance_km": km, "eta_minutes": eta,
-                                "status": status, "load_kg": 5500})
+        db.insert("trip_legs", {
+            "id": uid("LEG"), "trip_id": _uuid_id("TRIP-002"), "leg_no": leg_no, "leg_type": leg_type,
+            "from_name": frm, "to_name": to, "from_lat": flat, "from_lng": flng,
+            "to_lat": tlat, "to_lng": tlng, "distance_km": km, "eta_minutes": eta,
+            "status": status, "load_kg": 5500,
+        })
     for sid in ("SHP-3001", "SHP-3002"):
-        db.insert("trip_shipments", {"trip_id": "TRIP-002", "shipment_id": sid})
+        db.insert("trip_shipments", {
+            "trip_id": _uuid_id("TRIP-002"), "shipment_id": _uuid_id(sid),
+        })
 
-    # a trip that is on the road *right now* for the primary demo transporter,
-    # so the live fleet view has something real to show on a fresh install
     db.insert("transport_assignments", {
-        "id": "ASG-003", "pool_id": "POOL-DEMO-01", "transporter_id": "USR-TRN-01", "vehicle_id": "VEH-03",
+        "id": _uuid_id("ASG-003"), "pool_id": POOL_ID,
+        "transporter_id": _uuid_id("USR-TRN-01"), "vehicle_id": _uuid_id("VEH-03"),
         "status": "confirmed", "revenue": 2210, "distance_km": 51.6, "ready_check": "ready",
         "accepted_at": (LIVE - timedelta(minutes=45)).isoformat(),
         "created_at": iso(NOW - timedelta(hours=4)), "updated_at": now,
     })
-    db.insert("trips", {"id": "TRIP-003", "assignment_id": "ASG-003", "trip_code": "CX-TRIP-9032",
-                        "status": "in_transit", "vehicle_id": "VEH-03", "driver_name": "Sukhwinder Singh",
-                        "started_at": (LIVE - timedelta(minutes=28)).isoformat(),
-                        "created_at": iso(NOW - timedelta(hours=2))})
+    db.insert("trips", {
+        "id": _uuid_id("TRIP-003"), "assignment_id": _uuid_id("ASG-003"),
+        "trip_code": "CX-TRIP-9032", "status": "in_transit",
+        "vehicle_id": _uuid_id("VEH-03"), "driver_name": "Sukhwinder Singh",
+        "started_at": (LIVE - timedelta(minutes=28)).isoformat(),
+        "created_at": iso(NOW - timedelta(hours=2)),
+    })
     for leg_no, leg_type, frm, to, flat, flng, tlat, tlng, km, eta, status in [
         (1, "first_mile", "Isewal", "Isewal Roadside Transfer Shed", 30.8244, 76.1810, 30.821, 76.174, 3.1, 14, "done"),
         (2, "line_haul", "Isewal Roadside Transfer Shed", "Khanna Mandi", 30.821, 76.174, 30.704, 76.223, 48.5, 96, "active"),
     ]:
-        db.insert("trip_legs", {"id": uid("LEG"), "trip_id": "TRIP-003", "leg_no": leg_no, "leg_type": leg_type,
-                                "from_name": frm, "to_name": to, "from_lat": flat, "from_lng": flng,
-                                "to_lat": tlat, "to_lng": tlng, "distance_km": km, "eta_minutes": eta,
-                                "status": status, "load_kg": 2100})
-    db.insert("trip_shipments", {"trip_id": "TRIP-003", "shipment_id": "SHP-3002"})
+        db.insert("trip_legs", {
+            "id": uid("LEG"), "trip_id": _uuid_id("TRIP-003"), "leg_no": leg_no, "leg_type": leg_type,
+            "from_name": frm, "to_name": to, "from_lat": flat, "from_lng": flng,
+            "to_lat": tlat, "to_lng": tlng, "distance_km": km, "eta_minutes": eta,
+            "status": status, "load_kg": 2100,
+        })
+    db.insert("trip_shipments", {
+        "trip_id": _uuid_id("TRIP-003"), "shipment_id": _uuid_id("SHP-3002"),
+    })
 
-    # an assignment the demo transporter has just ACCEPTED and not yet started —
-    # this is what the pickup arrival clock counts down on a fresh install
     db.insert("transport_assignments", {
-        "id": "ASG-004", "pool_id": "POOL-DEMO-01", "transporter_id": "USR-TRN-01", "vehicle_id": "VEH-01",
+        "id": _uuid_id("ASG-004"), "pool_id": POOL_ID,
+        "transporter_id": _uuid_id("USR-TRN-01"), "vehicle_id": _uuid_id("VEH-01"),
         "status": "transporter_accepted", "revenue": 1840, "distance_km": 24.6, "ready_check": "pending",
-        # anchored to the real seed moment, not the hour floor, so a fresh
-        # install always opens with a live clock counting down (not "overdue")
         "accepted_at": (LIVE - timedelta(minutes=6)).isoformat(),
         "created_at": iso(NOW - timedelta(hours=3)), "updated_at": now,
     })
-    db.insert("trips", {"id": "TRIP-004", "assignment_id": "ASG-004", "trip_code": "CX-TRIP-5510",
-                        "status": "planned", "vehicle_id": "VEH-01", "driver_name": "Sukhwinder Singh",
-                        "created_at": iso(NOW - timedelta(hours=1))})
-    db.insert("trip_legs", {"id": uid("LEG"), "trip_id": "TRIP-004", "leg_no": 1, "leg_type": "first_mile",
-                            "from_name": "Bhari", "to_name": "Bhari Cooperative Yard",
-                            "from_lat": 30.8421, "from_lng": 76.1520, "to_lat": 30.846, "to_lng": 76.159,
-                            "distance_km": 24.6, "eta_minutes": 90, "status": "planned", "load_kg": 1000})
-    db.insert("trip_shipments", {"trip_id": "TRIP-004", "shipment_id": "SHP-3001"})
+    db.insert("trips", {
+        "id": _uuid_id("TRIP-004"), "assignment_id": _uuid_id("ASG-004"),
+        "trip_code": "CX-TRIP-5510", "status": "planned",
+        "vehicle_id": _uuid_id("VEH-01"), "driver_name": "Sukhwinder Singh",
+        "created_at": iso(NOW - timedelta(hours=1)),
+    })
+    db.insert("trip_legs", {
+        "id": uid("LEG"), "trip_id": _uuid_id("TRIP-004"), "leg_no": 1, "leg_type": "first_mile",
+        "from_name": "Bhari", "to_name": "Bhari Cooperative Yard",
+        "from_lat": 30.8421, "from_lng": 76.1520, "to_lat": 30.846, "to_lng": 76.159,
+        "distance_km": 24.6, "eta_minutes": 90, "status": "planned", "load_kg": 1000,
+    })
+    db.insert("trip_shipments", {
+        "trip_id": _uuid_id("TRIP-004"), "shipment_id": _uuid_id("SHP-3001"),
+    })
 
     for sid in ("SHP-1001", "SHP-1004", "SHP-1005", "SHP-1006"):
-        db.insert("shipment_events", {"id": uid("EVT"), "entity_type": "shipment", "entity_id": sid,
-                                      "event_type": "status_snapshot", "actor_id": ADMIN_ID,
-                                      "payload": db.jdump({"status": "seeded"}), "seed_id": "demo",
-                                      "created_at": now})
+        db.insert("shipment_events", {
+            "id": uid("EVT"), "entity_type": "shipment", "entity_id": _uuid_id(sid),
+            "event_type": "status_snapshot", "actor_id": ADMIN_ID,
+            "payload": db.jdump({"status": "seeded"}), "seed_id": "demo",
+            "created_at": now,
+        })
 
     for pid, title, body in [
         (ADMIN_ID, "3 shipments await review", "Bhari, Isewal and Libra wheat consignments need approval."),
-        ("USR-SND-01", "Shipment CX-2600 submitted", "Your wheat consignment is in Admin review."),
-        ("USR-TRN-02", "New assignment available", "Tempo PB23IJ7890 has a matching Ludhiana corridor load."),
+        (_uuid_id("USR-SND-01"), "Shipment CX-2600 submitted", "Your wheat consignment is in Admin review."),
+        (_uuid_id("USR-TRN-02"), "New assignment available", "Tempo PB23IJ7890 has a matching Ludhiana corridor load."),
     ]:
-        db.insert("notifications", {"id": uid("NTF"), "profile_id": pid, "title": title, "body": body,
-                                    "kind": "action", "read_at": None, "created_at": now})
+        db.insert("notifications", {
+            "id": uid("NTF"), "profile_id": pid, "title": title, "body": body,
+            "kind": "action", "read_at": None, "created_at": now,
+        })
 
-    # forecast rows for the demo clusters
     today = date.today()
     for cluster, crop, acres in CROP_CLUSTERS:
         for off in range(0, 21, 7):
@@ -477,7 +532,7 @@ def run() -> dict:
             })
 
     db.insert("support_tickets", {
-        "id": "TKT-1001", "profile_id": "USR-SND-02", "role": "sender",
+        "id": _uuid_id("TKT-1001"), "profile_id": _uuid_id("USR-SND-02"), "role": "sender",
         "subject": "Pickup window conflict for tomato", "body": "Can the pickup be moved to 6am?",
         "status": "open", "created_at": now, "updated_at": now,
     })
