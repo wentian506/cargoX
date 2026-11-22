@@ -14,7 +14,7 @@ from .core.security import hash_password
 
 _BOOT = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
 NOW = _BOOT
-LIVE = datetime.now(timezone.utc)   # live rows anchor here so the register always looks "in progress"
+LIVE = datetime.now(timezone.utc)
 # `_BOOT` anchors trip clocks to the hour the seed ran; the live position is
 # derived from the *current* time at read time, so a server left running for a day
 # still shows vehicles mid-route instead of arrived everywhere.
@@ -74,6 +74,7 @@ MANDIS = [
 ]
 
 MARKET_PRICES = {
+    # commodity: {mandi: (min, mode, max) INR per quintal}
     "wheat": {"M-GOB": (2230, 2285, 2350), "M-KHN": (2210, 2270, 2330), "M-LDH": (2200, 2255, 2310),
               "M-JAG": (2180, 2240, 2300), "M-RAI": (2170, 2230, 2290)},
     "paddy": {"M-GOB": (2280, 2330, 2400), "M-KHN": (2270, 2320, 2385), "M-LDH": (2255, 2305, 2370),
@@ -95,6 +96,7 @@ CROP_CLUSTERS = [
 
 
 ADMIN_ID = _uuid_id("USR-OWNER") or "USR-OWNER"
+ORG_KIND = "hub_partner"
 
 
 def run() -> dict:
@@ -103,13 +105,21 @@ def run() -> dict:
 
     now = iso()
     orgs = [
-        ("ORG-CARGOX", "CARGOX Operations", "business"),
-        ("ORG-FPO-KHN", "Khanna Farmer Producer Group", "business"),
-        ("ORG-RETAIL-PAY", "Payal Agri Retail", "business"),
+        ("ORG-CARGOX", "CARGOX Operations", ORG_KIND, "Punjab", "Ludhiana", None),
+        ("ORG-FPO-KHN", "Khanna Farmer Producer Group", ORG_KIND, "Punjab", "Ludhiana", None),
+        ("ORG-RETAIL-PAY", "Payal Agri Retail", ORG_KIND, "Punjab", "Fatehgarh Sahib", None),
     ]
     for o in orgs:
-        db.insert("organisations", {"id": _uuid_id(o[0]), "name": o[1], "kind": o[2], "created_at": now})
+        db.insert("organisations", {
+            "id": _uuid_id(o[0]),
+            "name": o[1],
+            "kind": o[2],
+            "state": o[3],
+            "district": o[4],
+            "contact_email": o[5],
+        })
 
+    # ---------------------------------------------------------------- users --
     from .core.config import settings as _settings
     global ADMIN_ID
     for i, email in enumerate(_settings.ADMIN_EMAILS, start=1):
@@ -207,6 +217,7 @@ def run() -> dict:
             "lat": lat, "lng": lng, "queue_minutes": q,
         })
 
+    # road graph: village <-> hub <-> mandi with realistic surfaces
     edges = []
     def edge(a, b, surface, width, risk):
         edges.append((f"RE-{len(edges)+1:03d}", a, b, surface, width, risk))
@@ -242,6 +253,7 @@ def run() -> dict:
             "verified_at": iso(NOW - timedelta(days=95)),
         })
 
+    # market observations — 10 days history
     for commodity, mandi_prices in MARKET_PRICES.items():
         for mid, (mn, mode, mx) in mandi_prices.items():
             for d in range(10):
@@ -262,6 +274,7 @@ def run() -> dict:
             "queue_minutes": q, "source": "simulated", "created_at": now,
         })
 
+    # capacity blocks published by transporters
     blocks = [
         ("CAP-001", "USR-TRN-01", "VEH-01", "tractor_trolley", 2500, 9.0, "ludhiana->fatehgarh sahib", 3, 1200, 22),
         ("CAP-002", "USR-TRN-01", "VEH-03", "lcv", 7500, 22.0, "ludhiana->fatehgarh sahib", 3, 2500, 31),
@@ -280,6 +293,7 @@ def run() -> dict:
             "status": "published", "created_at": now,
         })
 
+    # ------------------------------------------------------------ shipments --
     demo_shipments = [
         ("USR-SND-01", "wheat", 4800, "V-KHN-01", "Bhari", 30.8421, 76.1520, "M-GOB", "Mandi Gobindgarh", 30.67, 76.29, "pending_admin_review"),
         ("USR-SND-02", "wheat", 3200, "V-KHN-02", "Isewal", 30.8244, 76.1810, "M-GOB", "Mandi Gobindgarh", 30.67, 76.29, "pending_admin_review"),
@@ -320,6 +334,7 @@ def run() -> dict:
             "queue_minutes": 45, "preference_rank": 1,
         })
 
+    # ---------------------------------------------------- pooled coalition --
     from .algorithms import shapley as _shapley
 
     POOL_ID = _uuid_id("POOL-DEMO-01")
@@ -518,6 +533,7 @@ def run() -> dict:
             "kind": "action", "read_at": None, "created_at": now,
         })
 
+    # forecast rows for the demo clusters
     today = date.today()
     for cluster, crop, acres in CROP_CLUSTERS:
         for off in range(0, 21, 7):
