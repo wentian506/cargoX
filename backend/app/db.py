@@ -2,9 +2,9 @@
 
 Two drivers, one interface:
 
-* **dev / this workspace** -> SQLite file (`:memory:` supported) so the whole
+- **dev / this workspace** -> SQLite file (`:memory:` supported) so the whole
   platform runs with zero external services.
-* **production** -> Postgres/PostGIS on Supabase via `DATABASE_URL`
+- **production** -> Postgres/PostGIS on Supabase via `DATABASE_URL`
   (psycopg 3).  Placeholders written as `?` are translated to `%s`, and the
   DDL/seed files use syntax that is valid on both engines.
 
@@ -66,6 +66,14 @@ def _sql(query: str) -> str:
     return query
 
 
+def _pg_rollback(conn: Any) -> None:
+    if _state["dialect"] == "postgres" and conn is not None:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
@@ -82,13 +90,17 @@ def q(query: str, params: Sequence[Any] | None = None) -> list[dict]:
     with _lock:
         conn = _state["conn"]
         cur = conn.cursor()
-        cur.execute(_sql(query), tuple(params or ()))
-        rows = _rows(cur)
-        # a returned row on an INSERT..RETURNING also acts as a write; commit
-        if _state["dialect"] == "postgres":
-            conn.commit()
-        cur.close()
-        return rows
+        try:
+            cur.execute(_sql(query), tuple(params or ()))
+            rows = _rows(cur)
+            if _state["dialect"] == "postgres":
+                conn.commit()
+            return rows
+        except Exception:
+            _pg_rollback(conn)
+            raise
+        finally:
+            cur.close()
 
 
 def one(query: str, params: Sequence[Any] | None = None) -> dict | None:
@@ -109,14 +121,17 @@ def execute(query: str, params: Sequence[Any] | None = None) -> int:
     with _lock:
         conn = _state["conn"]
         cur = conn.cursor()
-        cur.execute(_sql(query), tuple(params or ()))
-        n = cur.rowcount if cur.rowcount is not None else 0
-        if _state["dialect"] != "postgres":
-            pass  # autocommit mode (isolation_level=None)
-        else:
-            conn.commit()
-        cur.close()
-        return n
+        try:
+            cur.execute(_sql(query), tuple(params or ()))
+            n = cur.rowcount if cur.rowcount is not None else 0
+            if _state["dialect"] == "postgres":
+                conn.commit()
+            return n
+        except Exception:
+            _pg_rollback(conn)
+            raise
+        finally:
+            cur.close()
 
 
 def insert(table: str, data: dict) -> dict:
@@ -135,10 +150,15 @@ def executemany(query: str, seq: Iterable[Sequence[Any]]) -> None:
     with _lock:
         conn = _state["conn"]
         cur = conn.cursor()
-        cur.executemany(_sql(query), [tuple(x) for x in seq])
-        if _state["dialect"] == "postgres":
-            conn.commit()
-        cur.close()
+        try:
+            cur.executemany(_sql(query), [tuple(x) for x in seq])
+            if _state["dialect"] == "postgres":
+                conn.commit()
+        except Exception:
+            _pg_rollback(conn)
+            raise
+        finally:
+            cur.close()
 
 
 def executescript(script: str) -> None:
@@ -146,9 +166,13 @@ def executescript(script: str) -> None:
     with _lock:
         conn = _state["conn"]
         if _state["dialect"] == "postgres":
-            with conn.cursor() as cur:
-                cur.execute(script)
-            conn.commit()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(script)
+                conn.commit()
+            except Exception:
+                _pg_rollback(conn)
+                raise
         else:
             conn.executescript(script)
 
