@@ -37,7 +37,6 @@ export function googleAuthUrl(redirectPath = "/login"): string {
     scope: SCOPES,
     nonce: nonce(),
     prompt: "select_account",
-    include_granted_scopes: "true",
   });
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
 }
