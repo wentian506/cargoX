@@ -490,7 +490,7 @@ create table if not exists tracking_subscriptions (
   id text primary key,
   phone text not null,
   channel text not null default 'sms',          -- sms | whatsapp (delivery needs a provider key)
-  shipment_id text references shipments(id) on delete cascade,
+  shipment_id uuid references shipments(id) on delete cascade,
   trip_id uuid references trips(id) on delete cascade,
   created_at text not null
 );
