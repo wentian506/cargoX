@@ -1,8 +1,8 @@
 """Creates the CARGOX schema on whichever engine is configured.
 
 The single DDL template in `sql/schema.sql` is expanded here:
-* SQLite  -> the PostGIS geometry column is dropped (lat/lng columns remain).
-* Postgres-> a generated `location geometry(Point,4326)` column is added so the
+- SQLite  -> the PostGIS geometry column is dropped (lat/lng columns remain).
+- Postgres-> a generated `location geometry(Point,4326)` column is added so the
   Supabase deployment can use spatial indexes and PostGIS functions.
 """
 from __future__ import annotations
@@ -34,21 +34,27 @@ STATEMENT_SPLIT = re.compile(r";\s*\n")
 
 
 def create_all() -> None:
-    """Apply the DDL. `alter table ... add column` lines are applied individually so a
-    partially-upgraded database (the local SQLite file) converges without a reset."""
+    """Apply the DDL. `alter table` and `create index` statements are applied
+    individually so an already-provisioned or partially-upgraded database
+    converges without crashing startup."""
     db.connect()
     script = render(db.dialect())
-    plain, alters = [], []
+    plain, individual = [], []
     # strip SQL comments first, otherwise a leading "-- note" hides the statement
     cleaned = "\n".join(line for line in script.splitlines() if not line.strip().startswith("--"))
     for stmt in [x.strip() for x in cleaned.split(";") if x.strip()]:
-        (alters if stmt.lower().startswith("alter table") else plain).append(stmt)
-    db.executescript(";\n".join(plain) + ";")
-    for stmt in alters:
+        low = stmt.lower()
+        if low.startswith("alter table") or low.startswith("create index") or low.startswith("create unique index"):
+            individual.append(stmt)
+        else:
+            plain.append(stmt)
+    if plain:
+        db.executescript(";\n".join(plain) + ";")
+    for stmt in individual:
         try:
             db.execute(stmt)
         except Exception:
-            pass  # column already present
+            pass  # column or index already present / differs on existing table
 
 
 def migrate() -> list[str]:
