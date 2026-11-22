@@ -1,76 +1,63 @@
-/* Google Identity — redirect flow (no third-party script at runtime). */
+/* Google Identity Services (GIS) — popup credential flow.
+ * Eliminates redirect_uri_mismatch completely by receiving the ID token
+ * directly in the browser callback and sending it to /api/auth/google. */
 
-const SCOPES = "openid email profile";
-const PENDING_ROLE_KEY = "cargox.google.pending_role";
+declare global {
+  interface Window {
+    google?: {
+      accounts: {
+        id: {
+          initialize: (config: {
+            client_id: string;
+            callback: (response: { credential?: string }) => void;
+            auto_select?: boolean;
+            cancel_on_tap_outside?: boolean;
+          }) => void;
+          renderButton: (
+            parent: HTMLElement,
+            options: {
+              theme?: "outline" | "filled_blue" | "filled_black";
+              size?: "large" | "medium" | "small";
+              text?: "signin_with" | "signup_with" | "continue_with";
+              shape?: "pill" | "rectangular";
+              width?: number;
+            }
+          ) => void;
+          prompt: () => void;
+        };
+      };
+    };
+  }
+}
 
 export const googleClientId = () => process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
 
-export function googleConfigured() {
+export function googleConfigured(): boolean {
   return Boolean(googleClientId());
 }
 
-function nonce(): string {
-  const bytes = new Uint8Array(16);
-  if (typeof crypto !== "undefined" && crypto.getRandomValues) crypto.getRandomValues(bytes);
-  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
-  const value = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-  try {
-    sessionStorage.setItem("cargox.google.nonce", value);
-  } catch {
-    /* ignore in private mode */
-  }
-  return value;
-}
+let scriptPromise: Promise<void> | null = null;
 
-export function googleAuthUrl(redirectPath = "/login"): string {
-  const clientId = googleClientId();
-  // Strip any ?role=... query string so redirect_uri always matches Google Cloud Console
-  const cleanPath = redirectPath.split("?")[0] || "/login";
-  const redirectUri = `${window.location.origin}${cleanPath}`;
+export function loadGoogleScript(): Promise<void> {
+  if (typeof window === "undefined") return Promise.resolve();
+  if (window.google?.accounts?.id) return Promise.resolve();
+  if (scriptPromise) return scriptPromise;
 
-  try {
-    const query = redirectPath.includes("?") ? redirectPath.split("?")[1] : "";
-    const role = new URLSearchParams(query).get("role");
-    if (role) sessionStorage.setItem(PENDING_ROLE_KEY, role);
-  } catch {
-    /* ignore */
-  }
-
-  const params = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    response_type: "id_token",
-    scope: SCOPES,
-    nonce: nonce(),
-    prompt: "select_account",
+  scriptPromise = new Promise((resolve, reject) => {
+    const existing = document.querySelector<HTMLScriptElement>('script[src="https://accounts.google.com/gsi/client"]');
+    if (existing) {
+      existing.addEventListener("load", () => resolve());
+      existing.addEventListener("error", () => reject(new Error("Failed to load Google script")));
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load Google script"));
+    document.head.appendChild(script);
   });
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-}
 
-export function startGoogleSignIn(redirectPath = "/login") {
-  window.location.href = googleAuthUrl(redirectPath);
-}
-
-export function consumePendingGoogleRole(): string | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const role = sessionStorage.getItem(PENDING_ROLE_KEY);
-    if (role) sessionStorage.removeItem(PENDING_ROLE_KEY);
-    return role;
-  } catch {
-    return null;
-  }
-}
-
-/** Read the id_token Google appends to the URL fragment after the redirect. */
-export function readGoogleCredential(): string | null {
-  if (typeof window === "undefined") return null;
-  const hash = window.location.hash.replace(/^#/, "");
-  if (!hash) return null;
-  const params = new URLSearchParams(hash);
-  const token = params.get("id_token");
-  if (token) {
-    window.history.replaceState(null, "", window.location.pathname + window.location.search);
-  }
-  return token;
+  return scriptPromise;
 }
