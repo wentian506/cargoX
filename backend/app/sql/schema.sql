@@ -497,7 +497,7 @@ create table if not exists tracking_subscriptions (
 
 create table if not exists saved_places (
   id text primary key,
-  profile_id text not null references profiles(id) on delete cascade,
+  profile_id uuid not null references profiles(id) on delete cascade,
   label text not null,
   name text not null,
   state text,
