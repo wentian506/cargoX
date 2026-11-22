@@ -36,7 +36,7 @@ STATEMENT_SPLIT = re.compile(r";\s*\n")
 def create_all() -> None:
     """Apply the DDL. `alter table` and `create index` statements are applied
     individually so an already-provisioned or partially-upgraded database
-    converges without crashing startup."""
+    converges without aborting the transaction."""
     db.connect()
     script = render(db.dialect())
     plain, individual = [], []
@@ -44,7 +44,11 @@ def create_all() -> None:
     cleaned = "\n".join(line for line in script.splitlines() if not line.strip().startswith("--"))
     for stmt in [x.strip() for x in cleaned.split(";") if x.strip()]:
         low = stmt.lower()
-        if low.startswith("alter table") or low.startswith("create index") or low.startswith("create unique index"):
+        if (
+            low.startswith("alter table")
+            or low.startswith("create index")
+            or low.startswith("create unique index")
+        ):
             individual.append(stmt)
         else:
             plain.append(stmt)
@@ -53,8 +57,15 @@ def create_all() -> None:
     for stmt in individual:
         try:
             db.execute(stmt)
+            try:
+                db.execute("commit")
+            except Exception:
+                pass
         except Exception:
-            pass  # column or index already present / differs on existing table
+            try:
+                db.execute("rollback")
+            except Exception:
+                pass
 
 
 def migrate() -> list[str]:
