@@ -1,0 +1,52 @@
+# ---------------------------------------------------------------------------
+# Render blueprint — CARGOX API (FastAPI + uvicorn)
+#
+#   1. Push this repo to GitHub.
+#   2. Render dashboard -> New -> Blueprint -> pick the repo.
+#   3. Render reads this file, creates the service and asks for the secrets
+#      marked `sync: false`. Paste them once; they never enter the repo.
+# ---------------------------------------------------------------------------
+services:
+  - type: web
+    name: cargox-api
+    runtime: python
+    plan: starter              # free plan works too, but spins down when idle
+    region: singapore          # closest Render region to Indian users
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # ---- database (Supabase) -------------------------------------------
+      - key: DATABASE_URL
+        sync: false            # postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:6543/postgres
+      # ---- auth ----------------------------------------------------------
+      - key: CARGOX_SECRET_KEY
+        generateValue: true    # 64-char random; regenerating invalidates tokens
+      - key: CARGOX_TOKEN_TTL_HOURS
+        value: "24"
+      - key: GOOGLE_CLIENT_ID
+        sync: false            # same value as NEXT_PUBLIC_GOOGLE_CLIENT_ID on Vercel
+      # ---- admin access ---------------------------------------------------
+      # The owner Gmail lands in /admin via Google sign-in (no password).
+      # Add more addresses comma-separated; see docs/admin-access.md.
+      - key: CARGOX_ADMIN_EMAILS
+        value: mehakdeep.s2006@gmail.com
+      - key: PUBLIC_WEB_URL
+        sync: false            # https://your-app.vercel.app
+      # ---- admin password door -------------------------------------------
+      # Editable in the Render dashboard. Google sign-in needs no password.
+      - key: CARGOX_ADMIN_PASSWORD
+        generateValue: true
+      # ---- production posture -------------------------------------------
+      - key: CARGOX_RATE_LIMIT
+        value: "1"
+      - key: CARGOX_RATE_LIMIT_AUTH
+        value: "20"
+      - key: CARGOX_RATE_LIMIT_DEFAULT
+        value: "600"
+      - key: CARGOX_CORS_ORIGINS
+        sync: false            # https://your-app.vercel.app
+      - key: PYTHON_VERSION
+        value: "3.12.6"

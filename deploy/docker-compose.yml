@@ -1,0 +1,43 @@
+# Local production rehearsal: Postgres + PostGIS, the API and the web app.
+#   docker compose -f deploy/docker-compose.yml up --build
+services:
+  db:
+    image: postgis/postgis:15-3.4
+    environment:
+      POSTGRES_DB: cargox
+      POSTGRES_USER: cargox
+      POSTGRES_PASSWORD: cargox_local_pw
+    ports: ["5432:5432"]
+    volumes: ["cargox_pg:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cargox -d cargox"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: ../deploy/Dockerfile.backend
+    environment:
+      DATABASE_URL: postgresql://cargox:cargox_local_pw@db:5432/cargox
+      CARGOX_SECRET_KEY: local-compose-secret-change-me
+      CARGOX_CORS_ORIGINS: http://localhost:3000
+      CARGOX_ADMIN_EMAILS: mehakdeep.s2006@gmail.com
+      CARGOX_ADMIN_PASSWORD: mehak@2006   # local only — change for any real deployment
+      PORT: "8000"
+    ports: ["8000:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ../frontend
+      dockerfile: ../deploy/Dockerfile.frontend
+    environment:
+      CARGOX_API_URL: http://api:8000
+    ports: ["3000:3000"]
+    depends_on: [api]
+
+volumes:
+  cargox_pg:

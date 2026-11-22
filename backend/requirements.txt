@@ -1,0 +1,14 @@
+# CARGOX backend — Python dependencies
+#
+# or-tools is optional at runtime: app/algorithms/planning.py falls back to a
+# greedy nearest-vehicle construction if the solver import fails, so a plan is
+# always produced. Install it for the OR-Tools CVRPTW path.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic[email]>=2.6
+ortools>=9.8
+numpy>=1.26
+pandas>=2.1
+
+# Production database driver (SQLite is used automatically when DATABASE_URL is unset)
+psycopg[binary]>=3.1; python_version >= "3.11"

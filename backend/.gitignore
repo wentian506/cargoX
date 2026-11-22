@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+cargox.db
+cargox.db-wal
+cargox.db-shm
+.env

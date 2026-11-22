@@ -1,0 +1,150 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-poppins: "Poppins";
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* phones: never let a wide table / map / chart stretch the document. Each one
+   scrolls inside its own card instead of pushing the page sideways. */
+html, body { max-width: 100%; overflow-x: hidden; }
+
+/* Workspace default: soft grey canvas, near-black ink (reference dashboard) */
+body {
+  background: #f7f7f7;
+  color: #171717;
+  font-feature-settings: "ss01" 1;
+}
+
+::selection {
+  background: #ffd60a;
+  color: #171717;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #d4d4d4 transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: #d4d4d4; border-radius: 999px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* the dark rail renders on its own light-on-dark scroll scheme */
+.rail-scroll {
+  scrollbar-color: #3a3a3a transparent;
+  scrollbar-width: thin;
+}
+.rail-scroll::-webkit-scrollbar-thumb { background: #3a3a3a; }
+
+@layer components {
+  /* ---------------------------------------------------------- surfaces -- */
+  .card {
+    @apply rounded-xl2 border border-line bg-surface;
+    box-shadow: 0 1px 2px rgba(23, 23, 23, 0.04);
+  }
+  .card-pad { @apply p-5; }
+  .card-flat { @apply rounded-xl2 border border-line bg-surface; }
+
+  /* ------------------------------------------------------------ text ---- */
+  .label { @apply text-[11px] font-medium text-ink-muted; }
+  .h-title { @apply text-[17px] font-semibold tracking-[-0.01em] text-ink; }
+  .kpi { @apply text-[26px] font-semibold leading-none tracking-[-0.02em] text-ink; }
+  .eyebrow { @apply text-[10px] font-semibold uppercase tracking-[0.14em] text-ink-faint; }
+
+  /* ---------------------------------------------------------- buttons --- */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-pill px-4 py-2.5 text-[13px] font-medium
+           transition-all duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary { @apply btn bg-accent text-ink hover:bg-accent-600 active:scale-[.99]; }
+  .btn-dark { @apply btn bg-rail text-white hover:bg-black active:scale-[.99]; }
+  .btn-emerald { @apply btn bg-forest text-white hover:bg-emerald-700 active:scale-[.99]; }
+  .btn-outline { @apply btn border border-line bg-white text-ink hover:border-ink/25 hover:bg-soft; }
+  .btn-ghost { @apply btn text-ink-muted hover:bg-soft hover:text-ink; }
+  .btn-danger { @apply btn border border-red-200 bg-red-50 text-red-700 hover:bg-red-100; }
+  .btn-sm { @apply px-3 py-1.5 text-[12px]; }
+  .btn-lg { @apply px-5 py-3 text-[14px]; }
+
+  /* ----------------------------------------------------------- inputs --- */
+  .input {
+    @apply w-full rounded-xl border border-line bg-white px-3.5 py-2.5 text-[13.5px] text-ink
+           placeholder:text-ink-faint focus:border-ink/40 focus:outline-none focus:ring-2 focus:ring-accent/40;
+  }
+  .select { @apply input appearance-none bg-white pr-9; }
+
+  /* ------------------------------------------------------------ chips --- */
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-pill border px-2.5 py-1 text-[11px] font-medium;
+  }
+
+  /* ----------------------------------------------------------- tables --- */
+  /* Phones: a bare `.grid` creates one implicit *auto* track, which sizes to the
+     widest child (a 640px table) and drags the page sideways. Pinning it to
+     minmax(0,1fr) makes each card shrink to the screen; explicit `grid-cols-*`
+     utilities still win because they are emitted later in the utilities layer. */
+  @media (max-width: 1023px) {
+    .grid { grid-template-columns: minmax(0, 1fr); }
+  }
+
+  /* min-w-0 lets an overflowing table scroll *inside* its card instead of
+     stretching the grid/flex parent and the whole page on phones */
+  .table-wrap { @apply w-full min-w-0 max-w-full overflow-x-auto overscroll-x-contain; }
+  .th { @apply whitespace-nowrap px-4 py-2.5 text-left text-[11px] font-medium text-ink-faint; }
+  .td { @apply whitespace-nowrap border-t border-line px-4 py-3 text-[13px] text-ink; }
+
+  /* --------------------------------------------------------- nav rail --- */
+  .rail-item {
+    @apply flex items-center gap-2.5 rounded-pill px-3 py-[7px] text-[12.5px] font-medium text-white/60
+           transition-colors hover:bg-white/[0.06] hover:text-white;
+  }
+  .rail-item-active { @apply bg-accent font-semibold text-ink hover:bg-accent hover:text-ink; }
+  .rail-group { @apply px-3 pb-1.5 pt-4 text-[10px] font-semibold uppercase tracking-[0.14em] text-white/30; }
+
+  /* --------------------------------------------------------- skeleton --- */
+  .skel { @apply relative overflow-hidden rounded-lg bg-line/70; }
+  .skel::after {
+    content: "";
+    @apply absolute inset-0 -translate-x-full animate-shimmer bg-gradient-to-r from-transparent via-white/70 to-transparent;
+  }
+}
+
+/* --------------------------------------------------- marketing helpers -- */
+.grid-paper {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+.text-balance { text-wrap: balance; }
+
+/* glassy auth card (reference: foggy bridge login) */
+.auth-glass {
+  background: rgba(18, 22, 27, 0.55);
+  backdrop-filter: blur(18px) saturate(120%);
+  -webkit-backdrop-filter: blur(18px) saturate(120%);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: 0 30px 80px -30px rgba(0, 0, 0, 0.75);
+}
+.auth-field {
+  width: 100%;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 12px 20px;
+  font-size: 13.5px;
+  color: #fff;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.auth-field::placeholder { color: rgba(255, 255, 255, 0.55); }
+.auth-field:focus {
+  border-color: rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.1);
+}
