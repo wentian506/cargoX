@@ -132,14 +132,19 @@ def run() -> dict:
         pid = _uuid_id(raw_pid)
         if i == 1 and pid:
             ADMIN_ID = pid
-        db.insert("profiles", {
-            "id": pid, "email": email, "mobile": None,
-            "password_hash": hash_password(_settings.ADMIN_PASSWORD, 20000),
-            "role": "admin", "full_name": _settings.ADMIN_NAME,
-            "state": "Punjab", "district": "Ludhiana", "language": "en",
-            "org_id": _uuid_id("ORG-CARGOX"), "status": "active", "verified_at": now,
-            "created_at": now, "auth_provider": "google",
-        })
+        try:
+            db.insert("profiles", {
+                "id": pid, "email": email, "mobile": None,
+                "password_hash": hash_password(_settings.ADMIN_PASSWORD, 20000),
+                "role": "admin", "full_name": _settings.ADMIN_NAME,
+                "state": "Punjab", "district": "Ludhiana", "language": "en",
+                "org_id": _uuid_id("ORG-CARGOX"), "status": "active", "verified_at": now,
+                "created_at": now, "auth_provider": "google",
+            })
+        except Exception as exc:
+            if "cargox_block_public_admin" in str(exc) or "Admin accounts are provisioned by invitation only" in str(exc):
+                continue
+            raise
 
     for pid, email, role, name, state, district in [
         ("USR-SND-01", "register.party1@cargox.invalid", "sender", "Bhari Farmer Group", "Punjab", "Ludhiana"),
@@ -157,8 +162,9 @@ def run() -> dict:
         })
 
     for pid, kind, village in [
-        ("USR-SND-01", "farmer", "Bhari"), ("USR-SND-02", "farmer", "Isewal"),
-        ("USR-SND-03", "shipper", "Sahnewal"),
+        ("USR-SND-01", "farmer", "Bhari"),
+        ("USR-SND-02", "farmer", "Isewal"),
+        ("USR-SND-03", "farmer", "Sahnewal"),
     ]:
         db.insert("sender_profiles", {
             "profile_id": _uuid_id(pid), "account_kind": kind,
