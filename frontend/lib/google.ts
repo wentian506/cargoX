@@ -1,12 +1,7 @@
-/* Google Identity — redirect flow (no third-party script at runtime).
- *
- * The login screen is fully usable offline: if NEXT_PUBLIC_GOOGLE_CLIENT_ID is
- * unset the button explains how to enable it. When it is set, the button sends
- * the browser to Google's OAuth endpoint with response_type=id_token, and the
- * returned credential is verified server-side in /api/auth/google.
- */
+/* Google Identity — redirect flow (no third-party script at runtime). */
 
 const SCOPES = "openid email profile";
+const PENDING_ROLE_KEY = "cargox.google.pending_role";
 
 export const googleClientId = () => process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
 
@@ -22,14 +17,25 @@ function nonce(): string {
   try {
     sessionStorage.setItem("cargox.google.nonce", value);
   } catch {
-    /* private mode — the server checks aud/iss/exp regardless */
+    /* ignore in private mode */
   }
   return value;
 }
 
 export function googleAuthUrl(redirectPath = "/login"): string {
   const clientId = googleClientId();
-  const redirectUri = `${window.location.origin}${redirectPath}`;
+  // Strip any ?role=... query string so redirect_uri always matches Google Cloud Console
+  const cleanPath = redirectPath.split("?")[0] || "/login";
+  const redirectUri = `${window.location.origin}${cleanPath}`;
+
+  try {
+    const query = redirectPath.includes("?") ? redirectPath.split("?")[1] : "";
+    const role = new URLSearchParams(query).get("role");
+    if (role) sessionStorage.setItem(PENDING_ROLE_KEY, role);
+  } catch {
+    /* ignore */
+  }
+
   const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: redirectUri,
@@ -45,6 +51,17 @@ export function startGoogleSignIn(redirectPath = "/login") {
   window.location.href = googleAuthUrl(redirectPath);
 }
 
+export function consumePendingGoogleRole(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const role = sessionStorage.getItem(PENDING_ROLE_KEY);
+    if (role) sessionStorage.removeItem(PENDING_ROLE_KEY);
+    return role;
+  } catch {
+    return null;
+  }
+}
+
 /** Read the id_token Google appends to the URL fragment after the redirect. */
 export function readGoogleCredential(): string | null {
   if (typeof window === "undefined") return null;
@@ -53,7 +70,6 @@ export function readGoogleCredential(): string | null {
   const params = new URLSearchParams(hash);
   const token = params.get("id_token");
   if (token) {
-    // clean the address bar so a refresh does not replay the token
     window.history.replaceState(null, "", window.location.pathname + window.location.search);
   }
   return token;
