@@ -103,7 +103,7 @@ def run() -> dict:
 
     now = iso()
     orgs = [
-        ("ORG-CARGOX", "CARGOX Operations", "platform"),
+        ("ORG-CARGOX", "CARGOX Operations", "business"),
         ("ORG-FPO-KHN", "Khanna Farmer Producer Group", "business"),
         ("ORG-RETAIL-PAY", "Payal Agri Retail", "business"),
     ]
