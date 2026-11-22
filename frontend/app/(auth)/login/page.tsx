@@ -7,12 +7,36 @@ import { Suspense, useCallback, useEffect, useState } from "react";
 import GoogleButton from "@/components/GoogleButton";
 import RolePicker, { ROLES, type Role } from "@/components/RolePicker";
 import { Modal, Spinner, useToast } from "@/components/ui";
-import { ApiError, auth, setToken } from "@/lib/api";
+import { ApiError, auth, clearToken, setToken } from "@/lib/api";
 import { googleConfigured } from "@/lib/google";
 import { homeFor, useSession } from "@/lib/session";
 
+const ALLOWED_ADMIN_EMAIL = "mehakdeep.s2006@gmail.com";
+
+function normalizeEmail(value?: string | null): string {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isAllowedAdminEmail(value?: string | null): boolean {
+  return normalizeEmail(value) === ALLOWED_ADMIN_EMAIL;
+}
+
+function resolveDashboardRoute(user: any, selectedRole: Role | null, nextParam: string | null): string {
+  const userEmail = normalizeEmail(user?.email);
+  if (isAllowedAdminEmail(userEmail)) {
+    return "/admin";
+  }
+
+  const resolvedRole = (user?.role || selectedRole || "sender") as Role;
+  if (nextParam && nextParam.startsWith("/") && !nextParam.startsWith("/admin")) {
+    return nextParam;
+  }
+
+  return homeFor(resolvedRole);
+}
+
 function LoginInner() {
-  const { login, refresh } = useSession();
+  const { refresh } = useSession();
   const router = useRouter();
   const params = useSearchParams();
   const { push } = useToast();
@@ -32,6 +56,7 @@ function LoginInner() {
   const [forgotMsg, setForgotMsg] = useState<string | null>(null);
   const [googleOn, setGoogleOn] = useState(false);
   const [ownerAdmins, setOwnerAdmins] = useState<string[]>([]);
+
   // Google identity that is not linked to an account yet: we show the address
   // Google returned, the user confirms it, and the account is created then.
   const [pendingCredential, setPendingCredential] = useState<string | null>(null);
@@ -65,21 +90,47 @@ function LoginInner() {
     setStep(2);
   };
 
-  const finish = async (user: any) => {
-    push("success", `Welcome back, ${String(user.full_name || "there").split(" ")[0]}`);
-    await refresh();                      // resolve the session before the guard runs
-    const next = params.get("next");
-    router.replace(next && next.startsWith("/") ? next : homeFor(user.role));
-  };
+  const finish = useCallback(
+    async (user: any) => {
+      const userEmail = normalizeEmail(user?.email);
+      const wantsAdmin = role === "admin" || user?.role === "admin";
+
+      // Strictly grant admin access only to mehakdeep.s2006@gmail.com
+      if (wantsAdmin && !isAllowedAdminEmail(userEmail)) {
+        clearToken();
+        setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
+        return;
+      }
+
+      push("success", `Welcome back, ${String(user?.full_name || "there").split(" ")[0]}`);
+      await refresh(); // resolve the session before the guard runs
+
+      const target = resolveDashboardRoute(user, role, params.get("next"));
+      router.replace(target);
+    },
+    [params, push, refresh, role, router]
+  );
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault();
     setBusy(true);
     setError(null);
+
+    if (role === "admin" && !isAllowedAdminEmail(email)) {
+      setBusy(false);
+      setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
+      return;
+    }
+
     try {
       const res = await auth.login({ email, password, role } as any);
+      if ((role === "admin" || res.user?.role === "admin") && !isAllowedAdminEmail(res.user?.email)) {
+        clearToken();
+        setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
+        return;
+      }
       setToken(res.token);
-      finish(res.user);
+      await finish(res.user);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not sign in");
     } finally {
@@ -91,16 +142,43 @@ function LoginInner() {
     async (credential: string) => {
       setBusy(true);
       setError(null);
+
+      const claims = decodeJwtPayload(credential);
+      const emailFromGoogle = normalizeEmail(claims?.email);
+
+      if (role === "admin" && !isAllowedAdminEmail(emailFromGoogle)) {
+        setBusy(false);
+        setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
+        return;
+      }
+
+      const targetRole: Role = isAllowedAdminEmail(emailFromGoogle)
+        ? "admin"
+        : role || "sender";
+
       try {
-        // 1st pass: sign in only. No account is created until the person sees
-        // the address Google returned and confirms it.
-        const res = await auth.google({ credential });
+        const res = await auth.google({
+          credential,
+          role: targetRole,
+          full_name: claims?.name || undefined,
+        });
+
+        const returnedEmail = normalizeEmail(res.user?.email || emailFromGoogle);
+        if ((targetRole === "admin" || res.user?.role === "admin") && !isAllowedAdminEmail(returnedEmail)) {
+          clearToken();
+          setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
+          return;
+        }
+
         setToken(res.token);
-        finish(res.user);
+        await finish(res.user);
       } catch (err) {
         const msg = err instanceof ApiError ? err.message : "";
-        const claims = decodeJwtPayload(credential);
         if (msg === "new_account_needs_role") {
+          if (targetRole === "admin" && !isAllowedAdminEmail(emailFromGoogle)) {
+            setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
+            return;
+          }
           setPendingCredential(credential);
           setGoogleEmail(claims?.email || null);
           setGName(claims?.name || "");
@@ -111,11 +189,17 @@ function LoginInner() {
         setBusy(false);
       }
     },
-    [finish]
+    [finish, role]
   );
 
   const createWithGoogle = async () => {
     if (!pendingCredential || !role) return;
+
+    if (role === "admin" && !isAllowedAdminEmail(googleEmail)) {
+      setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
+      return;
+    }
+
     setBusy(true);
     setError(null);
     try {
@@ -126,9 +210,17 @@ function LoginInner() {
         state: gState || undefined,
         district: gDistrict || undefined,
       });
+
+      const returnedEmail = normalizeEmail(res.user?.email || googleEmail);
+      if ((role === "admin" || res.user?.role === "admin") && !isAllowedAdminEmail(returnedEmail)) {
+        clearToken();
+        setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
+        return;
+      }
+
       setToken(res.token);
       push("success", "Google account linked", `Signed in as ${res.user.email}.`);
-      finish(res.user);
+      await finish(res.user);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not link this Google account");
     } finally {
@@ -143,6 +235,7 @@ function LoginInner() {
   };
 
   const roleLabel = ROLES.find((r) => r.id === role)?.label;
+  const displayedAdmins = ownerAdmins.length ? ownerAdmins : [ALLOWED_ADMIN_EMAIL];
 
   return (
     <>
@@ -179,7 +272,7 @@ function LoginInner() {
           </Link>
         </div>
         <div className="mt-10 flex items-center gap-2 text-[10.5px] text-white/35">
-          <ShieldCheck size={12} /> Admin accounts are invitation-only — there is no public Admin registration.
+          <ShieldCheck size={12} /> Admin accounts are restricted — only {ALLOWED_ADMIN_EMAIL} is authorized.
         </div>
       </div>
 
@@ -217,8 +310,8 @@ function LoginInner() {
               <RolePicker value={role} onChange={go} />
               <p className="mt-4 flex items-start gap-1.5 text-[10.5px] leading-relaxed text-white/35">
                 <Info size={11} className="mt-0.5 shrink-0" />
-                You sign in to the workspace that matches your role. Admin accounts are issued by an existing
-                administrator.
+                You sign in to the workspace that matches your role. Admin access is restricted to{" "}
+                {ALLOWED_ADMIN_EMAIL}.
               </p>
             </div>
           )}
@@ -228,19 +321,12 @@ function LoginInner() {
             <div className="mt-6 space-y-2.5">
               {role === "admin" && (
                 <div className="rounded-xl2 border border-accent/35 bg-accent/[0.08] px-3.5 py-2.5 text-[10.5px] leading-relaxed text-white/70">
-                  <span className="font-semibold text-white">Admin is invitation-only.</span>{" "}
-                  {ownerAdmins.length ? (
-                    <>
-                      The owner admin signs in with Google as{" "}
-                      <span className="font-semibold text-accent">{ownerAdmins[0]}</span>
-                      {ownerAdmins.length > 1 ? ` (+${ownerAdmins.length - 1} more)` : ""}. Other admins use the
-                      email + password issued to them.
-                    </>
-                  ) : (
-                    <>Use the Google account or credentials issued by an existing administrator.</>
-                  )}
+                  <span className="font-semibold text-white">Admin access is restricted.</span> Only{" "}
+                  <span className="font-semibold text-accent">{displayedAdmins[0]}</span> is authorized for the
+                  admin dashboard.
                 </div>
               )}
+
               <button
                 type="button"
                 onClick={() => setMethod("google")}
@@ -248,16 +334,30 @@ function LoginInner() {
               >
                 <span className="grid h-9 w-9 place-items-center rounded-full bg-white">
                   <svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true">
-                    <path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.6 2.6 30.2 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.8 6.1C12.3 13.3 17.6 9.5 24 9.5z" />
-                    <path fill="#4285F4" d="M46.1 24.6c0-1.6-.1-3.1-.4-4.6H24v9.1h12.4c-.5 2.9-2.2 5.4-4.7 7l7.6 5.9c4.4-4.1 6.8-10.1 6.8-17.4z" />
-                    <path fill="#FBBC05" d="M10.4 28.7a14.6 14.6 0 0 1 0-9.4l-7.8-6.1a24 24 0 0 0 0 21.6l7.8-6.1z" />
-                    <path fill="#34A853" d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.8 2.3-8.3 2.3-6.4 0-11.7-3.8-13.6-9.9l-7.8 6.1C6.5 42.6 14.6 48 24 48z" />
+                    <path
+                      fill="#EA4335"
+                      d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.6 2.6 30.2 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.8 6.1C12.3 13.3 17.6 9.5 24 9.5z"
+                    />
+                    <path
+                      fill="#4285F4"
+                      d="M46.1 24.6c0-1.6-.1-3.1-.4-4.6H24v9.1h12.4c-.5 2.9-2.2 5.4-4.7 7l7.6 5.9c4.4-4.1 6.8-10.1 6.8-17.4z"
+                    />
+                    <path
+                      fill="#FBBC05"
+                      d="M10.4 28.7a14.6 14.6 0 0 1 0-9.4l-7.8-6.1a24 24 0 0 0 0 21.6l7.8-6.1z"
+                    />
+                    <path
+                      fill="#34A853"
+                      d="M24 48c6.5 0 11.9-2.1 15.9-5.8l-7.6-5.9c-2.1 1.4-4.8 2.3-8.3 2.3-6.4 0-11.7-3.8-13.6-9.9l-7.8 6.1C6.5 42.6 14.6 48 24 48z"
+                    />
                   </svg>
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block text-[12.5px] font-semibold text-white">Sign in with Google</span>
                   <span className="block text-[10.5px] text-white/40">
-                    {googleOn ? "Use your Google account — no password to remember" : "Requires a Google client id (setup guide included)"}
+                    {googleOn
+                      ? "Use your Google account — no password to remember"
+                      : "Requires a Google client id (setup guide included)"}
                   </span>
                 </span>
                 <ArrowRight size={14} className="shrink-0 text-white/40" />
@@ -445,7 +545,6 @@ function LoginInner() {
               </button>
             </form>
           )}
-
         </div>
 
         <p className="mt-4 text-center text-[10px] leading-relaxed text-white/35">
@@ -470,9 +569,7 @@ function LoginInner() {
               className="btn-primary"
               onClick={async () => {
                 const res = await auth.forgot(forgotEmail);
-                setForgotMsg(
-                  res.message,
-                );
+                setForgotMsg(res.message);
               }}
             >
               Send reset link
