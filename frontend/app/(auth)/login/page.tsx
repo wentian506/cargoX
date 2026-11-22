@@ -7,7 +7,7 @@ import { Suspense, useCallback, useEffect, useState } from "react";
 import GoogleButton from "@/components/GoogleButton";
 import RolePicker, { ROLES, type Role } from "@/components/RolePicker";
 import { Modal, Spinner, useToast } from "@/components/ui";
-import { ApiError, auth, clearToken, setToken } from "@/lib/api";
+import { ApiError, auth, setToken } from "@/lib/api";
 import { googleConfigured } from "@/lib/google";
 import { homeFor, useSession } from "@/lib/session";
 
@@ -97,7 +97,7 @@ function LoginInner() {
 
       // Strictly grant admin access only to mehakdeep.s2006@gmail.com
       if (wantsAdmin && !isAllowedAdminEmail(userEmail)) {
-        clearToken();
+        setToken("");
         setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
         return;
       }
@@ -125,7 +125,7 @@ function LoginInner() {
     try {
       const res = await auth.login({ email, password, role } as any);
       if ((role === "admin" || res.user?.role === "admin") && !isAllowedAdminEmail(res.user?.email)) {
-        clearToken();
+        setToken("");
         setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
         return;
       }
@@ -165,7 +165,7 @@ function LoginInner() {
 
         const returnedEmail = normalizeEmail(res.user?.email || emailFromGoogle);
         if ((targetRole === "admin" || res.user?.role === "admin") && !isAllowedAdminEmail(returnedEmail)) {
-          clearToken();
+          setToken("");
           setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
           return;
         }
@@ -213,7 +213,7 @@ function LoginInner() {
 
       const returnedEmail = normalizeEmail(res.user?.email || googleEmail);
       if ((role === "admin" || res.user?.role === "admin") && !isAllowedAdminEmail(returnedEmail)) {
-        clearToken();
+        setToken("");
         setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
         return;
       }
