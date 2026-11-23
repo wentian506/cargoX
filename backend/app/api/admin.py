@@ -2,20 +2,17 @@
 assignment, delivery coordination, monitoring, audits."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .. import db
-from ..algorithms import compat, dispatch, planning, shapley, valueclock
+from ..algorithms import compat, dispatch, planning, shapley
 from ..algorithms.geo import CLASS_CAPACITY_KG, road_km
 from ..core.config import settings
 from ..core.security import Principal, admin_only
 from ..services.common import (
     ACTIVE_STATUSES,
     NOW,
-    STATUS_LABELS,
     audit,
     event,
     get_shipment,
@@ -27,6 +24,18 @@ from ..services.common import (
 )
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(admin_only)])
+
+
+def _is_postgres() -> bool:
+    return (db.dialect() or "").lower() in ("postgres", "postgresql")
+
+
+def _verified_true_sql() -> str:
+    return "verified is true" if _is_postgres() else "verified = 1"
+
+
+def _verified_false_sql() -> str:
+    return "coalesce(verified, false) is false" if _is_postgres() else "coalesce(verified, 0) = 0"
 
 
 # --------------------------------------------------------------------------- #
@@ -68,7 +77,7 @@ def overview():
     delivered = c("select count(*) from shipments where status='delivered'")
     vehicles_total = c("select count(*) from vehicles")
     vehicles_available = c("select count(*) from vehicles where availability='available'")
-    vehicles_verified = c("select count(*) from vehicles where verified = 1")
+    vehicles_verified = c(f"select count(*) from vehicles where {_verified_true_sql()}")
     assigned = c("select count(*) from transport_assignments where status in ('confirmed','sender_approved')")
     delayed = c("select count(*) from trips where delay_reported is not null and status <> 'delivered'")
     volume = db.scalar("select coalesce(sum(quantity_kg),0) from shipments where status <> 'cancelled'", default=0)
@@ -105,7 +114,7 @@ def _alerts() -> list[dict]:
     if pending:
         out.append({"kind": "action", "title": f"{len(pending)} shipment(s) awaiting review",
                     "body": ", ".join(p["code"] for p in pending[:4]), "link": "/admin/shipments"})
-    unverified = db.q("select id, reg_no from vehicles where verified = 0")
+    unverified = db.q(f"select id, reg_no from vehicles where {_verified_false_sql()}")
     if unverified:
         out.append({"kind": "warning", "title": f"{len(unverified)} vehicle(s) unverified",
                     "body": "Assignments are blocked until documents are verified.", "link": "/admin/vehicles"})
@@ -394,9 +403,9 @@ def generate_plan(payload: dict):
         "demand_kg": m["quantity_kg"], "ready_min": 0, "deadline_min": 480,
     } for m in members]
 
-    vehicles = db.q("""select v.*, cb.payload_kg as block_kg, cb.reserve_price_per_km
-                       from vehicles v left join capacity_blocks cb on cb.vehicle_id = v.id and cb.status='published'
-                       where v.verified = 1""")
+    vehicles = db.q(f"""select v.*, cb.payload_kg as block_kg, cb.reserve_price_per_km
+                        from vehicles v left join capacity_blocks cb on cb.vehicle_id = v.id and cb.status='published'
+                        where v.{_verified_true_sql()}""")
     veh_payload = [
         {"id": v["id"], "class": v["vehicle_class"],
          "capacity_kg": v["block_kg"] or v["payload_kg"],
