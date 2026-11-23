@@ -5,6 +5,21 @@ import { ArrowRight, MoreHorizontal } from "lucide-react";
 import Link from "next/link";
 import React, { useState } from "react";
 
+function toFiniteNumber(val: unknown, fallback = 0): number {
+  if (typeof val === "number") {
+    return Number.isFinite(val) ? val : fallback;
+  }
+  if (typeof val === "string" && val.trim() !== "") {
+    const parsed = Number(val);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+function safeFixed(val: unknown, digits = 1, fallback = 0): string {
+  return toFiniteNumber(val, fallback).toFixed(digits);
+}
+
 /* --------------------------------------------------------------- card ---- */
 export function DashCard({
   title,
@@ -62,20 +77,27 @@ export function Sparkline({
   width = 96,
   fill = true,
 }: {
-  values: number[];
+  values?: number[] | null;
   colour?: string;
   height?: number;
   width?: number;
   fill?: boolean;
 }) {
-  const v = values.length > 1 ? values : [0, ...(values.length ? values : [0, 0])];
+  const safeValues = Array.isArray(values) ? values.map((v) => toFiniteNumber(v, 0)) : [];
+  const v = safeValues.length > 1 ? safeValues : [0, ...(safeValues.length ? safeValues : [0, 0])];
   const max = Math.max(...v);
   const min = Math.min(...v);
   const span = max - min || 1;
-  const step = width / (v.length - 1);
-  const pts = v.map((val, i) => [i * step, height - 3 - ((val - min) / span) * (height - 6)]);
-  const d = pts.map((p, i) => `${i === 0 ? "M" : "L"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
-  const id = `sp-${colour.replace("#", "")}-${height}`;
+  const denom = Math.max(1, v.length - 1);
+  const step = width / denom;
+  const pts = v.map((val, i) => [
+    i * step,
+    height - 3 - ((val - min) / span) * Math.max(1, height - 6),
+  ]);
+  const d = pts
+    .map((p, i) => `${i === 0 ? "M" : "L"}${safeFixed(p[0], 1)},${safeFixed(p[1], 1)}`)
+    .join(" ");
+  const id = `sp-${(colour || "FFD60A").replace("#", "")}-${height}`;
   return (
     <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden>
       <defs>
@@ -96,13 +118,13 @@ export function Sparkline({
 }
 
 /* ------------------------------------------------------------- bar chart -- */
-export type BarSeriesDef = { name: string; colour: string; values: number[] };
+export type BarSeriesDef = { name: string; colour: string; values?: number[] | null };
 
 export function BarSeries({
-  labels,
-  series,
+  labels = [],
+  series = [],
   height = 190,
-  format = (n: number) => n.toLocaleString("en-IN"),
+  format = (n: number) => toFiniteNumber(n, 0).toLocaleString("en-IN"),
   highlight,
   unit,
   barColour,
@@ -117,7 +139,11 @@ export function BarSeries({
   barColour?: (i: number) => string | undefined;
 }) {
   const [active, setActive] = useState<number | null>(null);
-  const totals = labels.map((_, i) => series.reduce((a, s) => a + (s.values[i] || 0), 0));
+  const safeLabels = Array.isArray(labels) ? labels : [];
+  const safeSeries = Array.isArray(series) ? series : [];
+  const totals = safeLabels.map((_, i) =>
+    safeSeries.reduce((a, s) => a + toFiniteNumber(s?.values?.[i], 0), 0),
+  );
   const max = Math.max(1, ...totals);
   /* `highlight` emphasises a bar; the tooltip only appears on hover */
   const shown = active ?? highlight ?? null;
@@ -138,53 +164,62 @@ export function BarSeries({
         </div>
 
         <div className="absolute inset-0 flex items-end pl-10">
-          {labels.map((l, i) => (
-            <div
-              key={l + i}
-              className="group relative flex h-full flex-1 flex-col items-center justify-end px-[3px]"
-              onMouseEnter={() => setActive(i)}
-              onMouseLeave={() => setActive(null)}
-            >
-              {active === i && (
-                <div className="pointer-events-none absolute -top-1 z-10 min-w-[104px] -translate-y-full rounded-xl border border-line bg-white px-2.5 py-2 text-left shadow-lift">
-                  <div className="text-[9.5px] font-medium text-ink-faint">{l}</div>
-                  {series.map((s) => (
-                    <div key={s.name} className="mt-1 flex items-center gap-1.5">
-                      <span className="h-1.5 w-1.5 rounded-full" style={{ background: s.colour }} />
-                      <span className="text-[9.5px] text-ink-muted">{s.name}</span>
-                      <span className="ml-auto text-[10px] font-semibold text-ink">
-                        {format(s.values[i] || 0)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
+          {safeLabels.map((l, i) => {
+            const barVal = toFiniteNumber(totals[i], 0);
+            return (
               <div
-                className={clsx(
-                  "flex w-full max-w-[26px] flex-col-reverse gap-[2px] rounded-t-md transition-opacity",
-                  shown !== null && shown !== i ? "opacity-45" : "opacity-100",
-                )}
-                style={{ height: `${Math.max(3, (totals[i] / max) * 100)}%` }}
+                key={`${String(l)}-${i}`}
+                className="group relative flex h-full flex-1 flex-col items-center justify-end px-[3px]"
+                onMouseEnter={() => setActive(i)}
+                onMouseLeave={() => setActive(null)}
               >
-                {series.map((s) => (
-                  <div
-                    key={s.name}
-                    style={{
-                      background: barColour?.(i) ?? s.colour,
-                      height: `${totals[i] ? ((s.values[i] || 0) / totals[i]) * 100 : 0}%`,
-                    }}
-                    className="w-full"
-                  />
-                ))}
+                {active === i && (
+                  <div className="pointer-events-none absolute -top-1 z-10 min-w-[104px] -translate-y-full rounded-xl border border-line bg-white px-2.5 py-2 text-left shadow-lift">
+                    <div className="text-[9.5px] font-medium text-ink-faint">{l}</div>
+                    {safeSeries.map((s) => {
+                      const itemVal = toFiniteNumber(s?.values?.[i], 0);
+                      return (
+                        <div key={s.name} className="mt-1 flex items-center gap-1.5">
+                          <span className="h-1.5 w-1.5 rounded-full" style={{ background: s.colour }} />
+                          <span className="text-[9.5px] text-ink-muted">{s.name}</span>
+                          <span className="ml-auto text-[10px] font-semibold text-ink">
+                            {format(itemVal)}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <div
+                  className={clsx(
+                    "flex w-full max-w-[26px] flex-col-reverse gap-[2px] rounded-t-md transition-opacity",
+                    shown !== null && shown !== i ? "opacity-45" : "opacity-100",
+                  )}
+                  style={{ height: `${Math.max(3, (barVal / max) * 100)}%` }}
+                >
+                  {safeSeries.map((s) => {
+                    const segVal = toFiniteNumber(s?.values?.[i], 0);
+                    return (
+                      <div
+                        key={s.name}
+                        style={{
+                          background: barColour?.(i) ?? s.colour,
+                          height: `${barVal ? (segVal / barVal) * 100 : 0}%`,
+                        }}
+                        className="w-full"
+                      />
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
       <div className="mt-2 flex pl-10">
-        {labels.map((l, i) => (
+        {safeLabels.map((l, i) => (
           <div
-            key={l + i}
+            key={`${String(l)}-${i}`}
             className={clsx(
               "flex-1 text-center text-[9.5px]",
               shown === i ? "font-semibold text-ink" : "text-ink-faint",
@@ -247,10 +282,16 @@ export function MonthStrip({
   marked = [],
 }: {
   /** ISO date string for the highlighted day */
-  selected: string;
-  marked?: string[];
+  selected?: string | null;
+  marked?: string[] | null;
 }) {
-  const base = new Date(selected + "T00:00:00");
+  const fallbackIso = new Date().toISOString().slice(0, 10);
+  const candidate = typeof selected === "string" && selected.trim() ? selected.trim() : fallbackIso;
+  const parsed = new Date(`${candidate}T00:00:00`);
+  const base = Number.isNaN(parsed.getTime()) ? new Date(`${fallbackIso}T00:00:00`) : parsed;
+  const activeIso = Number.isNaN(parsed.getTime()) ? fallbackIso : candidate;
+  const safeMarked = Array.isArray(marked) ? marked : [];
+
   const year = base.getFullYear();
   const month = base.getMonth();
   const first = new Date(year, month, 1);
@@ -287,13 +328,13 @@ export function MonthStrip({
               key={d}
               className={clsx(
                 "relative mx-auto grid h-7 w-7 place-items-center rounded-full text-[10.5px]",
-                iso(d) === selected
+                iso(d) === activeIso
                   ? "bg-accent font-semibold text-ink"
                   : "text-ink-muted hover:bg-soft",
               )}
             >
               {d}
-              {marked.includes(iso(d)) && iso(d) !== selected && (
+              {safeMarked.includes(iso(d)) && iso(d) !== activeIso && (
                 <span className="absolute bottom-1 h-0.5 w-0.5 rounded-full bg-ink-faint" />
               )}
             </span>
@@ -322,9 +363,10 @@ export function Rows({
     warn: "bg-accent-100 text-ink",
     good: "bg-emerald-50 text-emerald-600",
   } as const;
+  const safeItems = Array.isArray(items) ? items : [];
   return (
     <ul className="space-y-1">
-      {items.map((it, i) => {
+      {safeItems.map((it, i) => {
         const body = (
           <div className="flex items-center gap-3 rounded-xl px-1.5 py-2 transition-colors hover:bg-soft/70">
             <span
@@ -343,7 +385,7 @@ export function Rows({
           </div>
         );
         return (
-          <li key={it.title + i}>
+          <li key={`${it.title}-${i}`}>
             {it.href ? <Link href={it.href}>{body}</Link> : body}
           </li>
         );
@@ -353,8 +395,9 @@ export function Rows({
 }
 
 /* --------------------------------------------------------------- gauge --- */
-export function Gauge({ value, label }: { value: number; label?: string }) {
-  const pct = Math.max(0, Math.min(1, value));
+export function Gauge({ value, label }: { value?: number | null; label?: string }) {
+  const numeric = toFiniteNumber(value, 0);
+  const pct = Math.max(0, Math.min(1, numeric));
   const r = 26;
   const c = 2 * Math.PI * r;
   return (
@@ -369,7 +412,7 @@ export function Gauge({ value, label }: { value: number; label?: string }) {
           stroke="#FFD60A"
           strokeWidth="7"
           strokeLinecap="round"
-          strokeDasharray={`${c * pct} ${c}`}
+          strokeDasharray={`${safeFixed(c * pct, 2)} ${safeFixed(c, 2)}`}
         />
       </svg>
       <div>
