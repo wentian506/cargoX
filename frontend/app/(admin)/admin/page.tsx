@@ -1,15 +1,12 @@
 "use client";
 
 import {
-  ArrowRight,
   BadgeCheck,
   Boxes,
   ClipboardList,
   Clock,
   Container,
-  IndianRupee,
   Layers,
-  Package,
   PiggyBank,
   ScanLine,
   ShieldCheck,
@@ -30,13 +27,11 @@ import {
 } from "@/components/dashboard";
 import MapView from "@/components/LiveMap";
 import { Badge, EmptyState, ErrorNote, Loading, Progress, SyntheticNote, Table } from "@/components/ui";
-import { inr, kg, titleCase, when } from "@/lib/api";
+import { inr, kg, titleCase } from "@/lib/api";
 import { useApi } from "@/lib/hooks";
 import { useGuard, useSession } from "@/lib/session";
 
 const YELLOW = "#FFD60A";
-const BLACK = "#171717";
-const MUTED = "#DCDCDC";
 
 export default function AdminOverview() {
   const { ready } = useGuard("admin");
@@ -51,12 +46,21 @@ export default function AdminOverview() {
 
   /* commodity demand series — real numbers from /analytics/admin */
   const { labels, series, topCommodity } = useMemo(() => {
-    const rows = analytics.data?.shipments?.by_commodity || [];
+    const raw = analytics.data?.shipments?.by_commodity;
+    const rows = Array.isArray(raw) ? raw.filter(Boolean) : [];
     if (!rows.length) return { labels: [], series: [], topCommodity: null as any };
-    const sorted = [...rows].sort((a: any, b: any) => b.kg - a.kg).slice(0, 8);
+    const sorted = [...rows]
+      .sort((a: any, b: any) => Number(b?.kg ?? 0) - Number(a?.kg ?? 0))
+      .slice(0, 8);
     return {
-      labels: sorted.map((r: any) => titleCase(r.commodity)),
-      series: [{ name: "Volume", colour: YELLOW, values: sorted.map((r: any) => Math.round(r.kg)) }],
+      labels: sorted.map((r: any) => titleCase(r?.commodity || "Other")),
+      series: [
+        {
+          name: "Volume",
+          colour: YELLOW,
+          values: sorted.map((r: any) => Math.round(Number(r?.kg ?? 0))),
+        },
+      ],
       topCommodity: sorted[0],
     };
   }, [analytics.data]);
@@ -65,10 +69,10 @@ export default function AdminOverview() {
   if (loading && !data) return <Loading rows={4} />;
   if (error) return <ErrorNote message={error} onRetry={reload} />;
 
-  const c = data.counts;
+  const c = data?.counts || {};
   const completedShare = c.total_shipments ? c.delivered / c.total_shipments : 0;
   const verifiedShare = c.vehicles_total ? c.vehicles_verified / c.vehicles_total : 0;
-  const coverage = Math.min(1, data.capacity_coverage_ratio || 0);
+  const coverage = Math.min(1, Number(data?.capacity_coverage_ratio ?? 0));
 
   return (
     <div className="space-y-3">
@@ -77,28 +81,28 @@ export default function AdminOverview() {
         {[
           {
             label: "Shipments in plan",
-            value: c.active_shipments,
+            value: c.active_shipments ?? 0,
             icon: <Container size={13} />,
             delta: 12,
-            spark: [4, 6, 5, 7, 6, 8, 7, c.active_shipments],
+            spark: [4, 6, 5, 7, 6, 8, 7, Number(c.active_shipments ?? 0)],
           },
           {
             label: "Awaiting review",
-            value: c.pending_review,
+            value: c.pending_review ?? 0,
             icon: <ClipboardList size={13} />,
             delta: -8,
-            spark: [5, 4, 6, 3, 4, 2, 3, c.pending_review],
+            spark: [5, 4, 6, 3, 4, 2, 3, Number(c.pending_review ?? 0)],
           },
           {
             label: "Freight savings",
-            value: inr(data.freight_savings, true),
+            value: inr(Number(data?.freight_savings ?? 0), true),
             icon: <PiggyBank size={13} />,
             delta: 6.8,
-            spark: [120, 240, 380, 520, 660, 810, 900, Math.round(data.freight_savings || 0)],
+            spark: [120, 240, 380, 520, 660, 810, 900, Math.round(Number(data?.freight_savings ?? 0))],
           },
           {
             label: "Capacity cover",
-            value: `${Math.round((data.capacity_coverage_ratio || 0) * 100)}%`,
+            value: `${Math.round(Number(data?.capacity_coverage_ratio ?? 0) * 100)}%`,
             icon: <Boxes size={13} />,
             delta: -3,
             spark: [72, 70, 74, 68, 71, 69, 67, 67],
@@ -157,7 +161,7 @@ export default function AdminOverview() {
                 labels={labels}
                 series={series}
                 height={252}
-                format={(n) => `${(n / 1000).toFixed(1)}t`}
+                format={(n) => `${(Number(n ?? 0) / 1000).toFixed(1)}t`}
                 highlight={0}
                 barColour={(i) => (i === 0 ? YELLOW : "#FFE873")}
               />
@@ -175,9 +179,9 @@ export default function AdminOverview() {
               </div>
               <div className="mt-3 grid grid-cols-3 gap-2">
                 {[
-                  ["Booked volume", kg(data.volume_kg)],
-                  ["Committed capacity", kg(data.committed_capacity_kg)],
-                  ["Uncovered demand", kg(data.uncovered_demand_kg)],
+                  ["Booked volume", kg(data?.volume_kg ?? 0)],
+                  ["Committed capacity", kg(data?.committed_capacity_kg ?? 0)],
+                  ["Uncovered demand", kg(data?.uncovered_demand_kg ?? 0)],
                 ].map(([l, v]) => (
                   <div key={String(l)} className="rounded-xl2 border border-line px-3 py-2">
                     <div className="text-[9.5px] text-ink-faint">{l}</div>
@@ -213,7 +217,7 @@ export default function AdminOverview() {
                 {
                   icon: <ScanLine size={12} />,
                   title: "Vehicle document gate",
-                  meta: `${c.vehicles_verified}/${c.vehicles_total} verified`,
+                  meta: `${c.vehicles_verified ?? 0}/${c.vehicles_total ?? 0} verified`,
                   value: "review",
                   href: "/admin/vehicles",
                 },
@@ -221,7 +225,7 @@ export default function AdminOverview() {
                   icon: <BadgeCheck size={12} />,
                   title: "Delivery verification",
                   meta: "POD + Admin reconciliation",
-                  value: `${c.delivered} closed`,
+                  value: `${c.delivered ?? 0} closed`,
                   tone: "good",
                   href: "/admin/deliveries",
                 },
@@ -329,16 +333,16 @@ export default function AdminOverview() {
           <DashCard title="Operations state">
             <div className="space-y-3.5">
               {[
-                ["Capacity cover", coverage, `${kg(data.committed_capacity_kg)} committed`, "accent"],
-                ["Verified fleet", verifiedShare, `${c.vehicles_verified} of ${c.vehicles_total}`, "emerald"],
-                ["Delivery completion", completedShare, `${c.delivered} of ${c.total_shipments}`, "ink"],
+                ["Capacity cover", coverage, `${kg(data?.committed_capacity_kg ?? 0)} committed`, "accent"],
+                ["Verified fleet", verifiedShare, `${c.vehicles_verified ?? 0} of ${c.vehicles_total ?? 0}`, "emerald"],
+                ["Delivery completion", completedShare, `${c.delivered ?? 0} of ${c.total_shipments ?? 0}`, "ink"],
               ].map(([label, v, sub, tone]: any) => (
                 <div key={label}>
                   <div className="mb-1.5 flex items-center justify-between text-[11px]">
                     <span className="text-ink-muted">{label}</span>
-                    <span className="font-semibold text-ink">{Math.round(v * 100)}%</span>
+                    <span className="font-semibold text-ink">{Math.round(Number(v ?? 0) * 100)}%</span>
                   </div>
-                  <Progress value={v} tone={tone} />
+                  <Progress value={Number(v ?? 0)} tone={tone} />
                   <div className="mt-1 text-[9.5px] text-ink-faint">{sub}</div>
                 </div>
               ))}
@@ -376,7 +380,7 @@ export default function AdminOverview() {
           pad={false}
         >
           <Table head={["Shipment", "Sender", "Commodity", "Qty", "Route", "Status"]}>
-            {(data.recent_shipments || []).slice(0, 6).map((s: any) => (
+            {(data?.recent_shipments || []).slice(0, 6).map((s: any) => (
               <tr key={s.id} className="transition-colors hover:bg-soft/60">
                 <td className="td font-semibold text-ink">{s.code}</td>
                 <td className="td text-[11.5px] text-ink-muted">{s.sender_name || s.sender_id}</td>
@@ -398,7 +402,7 @@ export default function AdminOverview() {
             <div className="flex items-end justify-between gap-4">
               <div>
                 <div className="text-[24px] font-semibold leading-none text-ink">
-                  {Math.round((analytics.data?.fairness?.participation_pass_rate || 0) * 100)}%
+                  {Math.round(Number(analytics.data?.fairness?.participation_pass_rate ?? 0) * 100)}%
                 </div>
                 <div className="mt-1 text-[10px] text-ink-faint">participation checks passing</div>
               </div>
@@ -408,7 +412,7 @@ export default function AdminOverview() {
               {[
                 ["Allocations", analytics.data?.fairness?.allocations ?? 0],
                 ["Approved", analytics.data?.fairness?.approved ?? 0],
-                ["Total saved", inr(analytics.data?.fairness?.total_savings, true)],
+                ["Total saved", inr(Number(analytics.data?.fairness?.total_savings ?? 0), true)],
                 ["Worse than solo", 0],
               ].map(([l, v]) => (
                 <div key={String(l)} className="rounded-xl2 bg-soft px-3 py-2">
@@ -424,14 +428,14 @@ export default function AdminOverview() {
               items={[
                 {
                   icon: <Users size={12} />,
-                  title: `${c.senders} senders registered`,
+                  title: `${c.senders ?? 0} senders registered`,
                   meta: "3 districts · synthetic records",
                   href: "/admin/senders",
                 },
                 {
                   icon: <Truck size={12} />,
-                  title: `${c.transporters} transporters`,
-                  meta: `${c.vehicles_verified}/${c.vehicles_total} vehicles verified`,
+                  title: `${c.transporters ?? 0} transporters`,
+                  meta: `${c.vehicles_verified ?? 0}/${c.vehicles_total ?? 0} vehicles verified`,
                   href: "/admin/transporters",
                 },
                 {
