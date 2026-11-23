@@ -1,9 +1,6 @@
 """Authentication: register (sender/transporter only), login, session, reset."""
 from __future__ import annotations
 
-import secrets
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 
@@ -22,6 +19,7 @@ from ..services.common import NOW, audit, notify, uid
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 PUBLIC_ROLES = ("sender", "transporter")   # admin is provisioned, never self-registered
+DEFAULT_OWNER_ADMIN = "mehakdeep.s2006@gmail.com"
 
 # ---------------------------------------------------------------------------
 # No demo accounts exist. Every role is entered with a real identity:
@@ -34,13 +32,17 @@ PUBLIC_ROLES = ("sender", "transporter")   # admin is provisioned, never self-re
 
 def _owner_admins() -> list[str]:
     """The invite-only Admin addresses (lower-cased) allowed to reach /admin."""
-    return [e.strip().lower() for e in settings.ADMIN_EMAILS if e and e.strip()]
+    configured = [e.strip().lower() for e in (settings.ADMIN_EMAILS or []) if e and e.strip()]
+    if DEFAULT_OWNER_ADMIN not in configured:
+        configured.append(DEFAULT_OWNER_ADMIN)
+    return configured
 
 
 def _promote_if_owner(row: dict) -> dict:
     """An owner address always resolves to the Admin role."""
-    if (row.get("email") or "").lower() in _owner_admins() and row.get("role") != "admin":
-        db.execute("update profiles set role = 'admin' where id = ?", (row["id"],))
+    user_id = str(row["id"])
+    if (row.get("email") or "").strip().lower() in _owner_admins() and row.get("role") != "admin":
+        db.execute("update profiles set role = 'admin' where id = ?", (user_id,))
         row["role"] = "admin"
     return row
 
@@ -85,11 +87,18 @@ class ProfileUpdateIn(BaseModel):
 
 def _public(profile: dict) -> dict:
     return {
-        "id": profile["id"], "email": profile["email"], "full_name": profile["full_name"],
-        "role": profile["role"], "status": profile["status"], "state": profile["state"],
-        "district": profile["district"], "preferred_language": profile["language"],
-        "mobile": profile["mobile"], "verified": bool(profile["verified_at"]),
-        "avatar": profile.get("avatar_url"), "provider": profile.get("auth_provider") or "password",
+        "id": str(profile["id"]),
+        "email": profile["email"],
+        "full_name": profile["full_name"],
+        "role": profile["role"],
+        "status": profile["status"],
+        "state": profile["state"],
+        "district": profile["district"],
+        "preferred_language": profile["language"],
+        "mobile": profile["mobile"],
+        "verified": bool(profile["verified_at"]),
+        "avatar": profile.get("avatar_url"),
+        "provider": profile.get("auth_provider") or "password",
     }
 
 
@@ -102,29 +111,65 @@ def register(body: RegisterIn, request: Request):
     if db.one("select id from profiles where lower(email) = ?", (body.email.lower(),)):
         raise HTTPException(409, "An account with this email already exists")
 
-    pid = uid("USR")
+    pid = str(uid("USR"))
     profile = {
-        "id": pid, "email": body.email.lower(), "mobile": body.mobile,
-        "password_hash": hash_password(body.password), "role": body.account_type,
-        "full_name": body.full_name.strip(), "state": body.state, "district": body.district,
-        "language": body.preferred_language, "org_id": None, "status": "active",
-        "verified_at": None, "created_at": NOW(),
+        "id": pid,
+        "email": body.email.lower(),
+        "mobile": body.mobile,
+        "password_hash": hash_password(body.password),
+        "role": body.account_type,
+        "full_name": body.full_name.strip(),
+        "state": body.state,
+        "district": body.district,
+        "language": body.preferred_language,
+        "org_id": None,
+        "status": "active",
+        "verified_at": None,
+        "created_at": NOW(),
     }
     db.insert("profiles", profile)
     if body.account_type == "sender":
-        db.insert("sender_profiles", {"profile_id": pid, "account_kind": "individual",
-                                      "village": body.village, "created_at": NOW()})
-        notify(pid, "Welcome to CARGOX", "Create your first shipment request — Admin will review it within the planning window.")
+        db.insert(
+            "sender_profiles",
+            {
+                "profile_id": pid,
+                "account_kind": "individual",
+                "village": body.village,
+                "created_at": NOW(),
+            },
+        )
+        notify(
+            pid,
+            "Welcome to CARGOX",
+            "Create your first shipment request — Admin will review it within the planning window.",
+        )
     else:
-        db.insert("transporter_profiles", {"profile_id": pid, "company_name": body.full_name,
-                                           "fleet_size": 0, "verification_status": "pending",
-                                           "rating": 0, "created_at": NOW()})
-        notify(pid, "Welcome to CARGOX", "Add your first vehicle. Admin verifies documents before assignments unlock.")
+        db.insert(
+            "transporter_profiles",
+            {
+                "profile_id": pid,
+                "company_name": body.full_name,
+                "fleet_size": 0,
+                "verification_status": "pending",
+                "rating": 0,
+                "created_at": NOW(),
+            },
+        )
+        notify(
+            pid,
+            "Welcome to CARGOX",
+            "Add your first vehicle. Admin verifies documents before assignments unlock.",
+        )
 
-    audit({"id": pid, "role": body.account_type}, "account.register",
-          entity_type="profile", entity_id=pid, after={"role": body.account_type},
-          ip=request.client.host if request.client else None)
-    token = create_token(pid, body.account_type)
+    audit(
+        {"id": pid, "role": body.account_type},
+        "account.register",
+        entity_type="profile",
+        entity_id=pid,
+        after={"role": body.account_type},
+        ip=request.client.host if request.client else None,
+    )
+    token = create_token(pid, str(body.account_type))
     return {"token": token, "user": _public(profile), "redirect": f"/{body.account_type}"}
 
 
@@ -135,32 +180,47 @@ def login(body: LoginIn, request: Request):
         raise HTTPException(401, "Invalid email or password")
     if row["status"] == "suspended":
         raise HTTPException(403, "This account is suspended. Contact support.")
+
     row = _promote_if_owner(dict(row))
-    if body.role and body.role != row["role"]:
+    user_id = str(row["id"])
+    user_role = str(row["role"])
+
+    if body.role and body.role != user_role:
         raise HTTPException(
             409,
-            f"This email is registered as {row['role'].title()}. Pick {row['role'].title()} "
+            f"This email is registered as {user_role.title()}. Pick {user_role.title()} "
             f"on the role selector, or create a separate {body.role.title()} account.",
         )
-    db.execute("update profiles set last_login_at = ? where id = ?", (NOW(), row["id"]))
-    audit({"id": row["id"], "role": row["role"]}, "account.login", entity_type="profile",
-          entity_id=row["id"], ip=request.client.host if request.client else None)
+
+    db.execute("update profiles set last_login_at = ? where id = ?", (NOW(), user_id))
+    audit(
+        {"id": user_id, "role": user_role},
+        "account.login",
+        entity_type="profile",
+        entity_id=user_id,
+        ip=request.client.host if request.client else None,
+    )
     return {
-        "token": create_token(row["id"], row["role"]),
+        "token": create_token(user_id, user_role),
         "user": _public(row),
-        "redirect": f"/{row['role']}",
+        "redirect": f"/{user_role}",
     }
 
 
 @router.get("/me")
 def me(principal: Principal = Depends(get_principal)):
-    row = db.one("select * from profiles where id = ?", (principal["id"],))
+    principal_id = str(principal["id"])
+    row = db.one("select * from profiles where id = ?", (principal_id,))
+    if not row:
+        raise HTTPException(404, "Profile not found")
+
+    row = _promote_if_owner(dict(row))
     extra: dict = {}
     if row["role"] == "sender":
-        sp = db.one("select * from sender_profiles where profile_id = ?", (row["id"],))
+        sp = db.one("select * from sender_profiles where profile_id = ?", (principal_id,))
         extra = {"sender": sp}
     elif row["role"] == "transporter":
-        tp = db.one("select * from transporter_profiles where profile_id = ?", (row["id"],))
+        tp = db.one("select * from transporter_profiles where profile_id = ?", (principal_id,))
         extra = {"transporter": tp}
     return {"user": _public(row), **extra}
 
@@ -168,8 +228,13 @@ def me(principal: Principal = Depends(get_principal)):
 @router.patch("/me")
 def update_me(body: ProfileUpdateIn, principal: Principal = Depends(get_principal)):
     sets, vals = [], []
-    mapping = {"full_name": "full_name", "mobile": "mobile", "state": "state",
-               "district": "district", "preferred_language": "language"}
+    mapping = {
+        "full_name": "full_name",
+        "mobile": "mobile",
+        "state": "state",
+        "district": "district",
+        "preferred_language": "language",
+    }
     for field, col in mapping.items():
         v = getattr(body, field)
         if v is not None:
@@ -177,7 +242,7 @@ def update_me(body: ProfileUpdateIn, principal: Principal = Depends(get_principa
             vals.append(v)
     if not sets:
         raise HTTPException(400, "No changes supplied")
-    vals.append(principal["id"])
+    vals.append(str(principal["id"]))
     db.execute(f"update profiles set {', '.join(sets)} where id = ?", vals)
     return {"updated": True}
 
@@ -195,7 +260,7 @@ def forgot_password(payload: dict):
     row = db.one("select id from profiles where lower(email) = ?", (email,)) if email else None
     out = {"message": "If that email exists, a reset link has been sent.", "delivery": "supabase_auth_email"}
     if row and db.dialect() == "sqlite":
-        out["reset_token"] = create_token(row["id"], "password_reset", ttl_hours=1)
+        out["reset_token"] = create_token(str(row["id"]), "password_reset", ttl_hours=1)
     return out
 
 
@@ -210,7 +275,7 @@ def reset_password(payload: dict):
     new = payload.get("password") or ""
     if len(new) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
-    db.execute("update profiles set password_hash = ? where id = ?", (hash_password(new), claims["sub"]))
+    db.execute("update profiles set password_hash = ? where id = ?", (hash_password(new), str(claims["sub"])))
     return {"reset": True}
 
 
@@ -236,7 +301,7 @@ def google_sign_in(body: GoogleIn, request: Request):
             "Google sign-in is not available on this deployment yet (GOOGLE_CLIENT_ID is not "
             "configured), or the token could not be verified.",
         )
-    email = (claims.get("email") or "").lower()
+    email = (claims.get("email") or "").strip().lower()
     if not email:
         raise HTTPException(400, "Google account has no email address")
     if settings.GOOGLE_ALLOWED_DOMAINS:
@@ -250,44 +315,90 @@ def google_sign_in(body: GoogleIn, request: Request):
     # address until the profile exists, so nobody can mint an admin by sign-in
     if row:
         row = _promote_if_owner(dict(row))
+        user_id = str(row["id"])
+        user_role = str(row["role"])
         if row["status"] != "active":
             raise HTTPException(403, "This account is suspended. Contact support.")
-        if body.role and body.role != row["role"]:
-            raise HTTPException(409, f"This email is registered as {row['role'].title()}.")
-        db.execute("update profiles set last_login_at = ?, google_sub = coalesce(google_sub, ?) where id = ?",
-                   (NOW(), claims.get("sub"), row["id"]))
-        audit({"id": row["id"], "role": row["role"]}, "account.login_google",
-              entity_type="profile", entity_id=row["id"],
-              ip=request.client.host if request.client else None)
-        return {"token": create_token(row["id"], row["role"]), "user": _public(row),
-                "redirect": f"/{row['role']}", "created": False}
+        if body.role and body.role != user_role:
+            raise HTTPException(409, f"This email is registered as {user_role.title()}.")
+        db.execute(
+            "update profiles set last_login_at = ?, google_sub = coalesce(google_sub, ?) where id = ?",
+            (NOW(), claims.get("sub"), user_id),
+        )
+        audit(
+            {"id": user_id, "role": user_role},
+            "account.login_google",
+            entity_type="profile",
+            entity_id=user_id,
+            ip=request.client.host if request.client else None,
+        )
+        return {
+            "token": create_token(user_id, user_role),
+            "user": _public(row),
+            "redirect": f"/{user_role}",
+            "created": False,
+        }
 
     role = (body.role or "").lower()
     if role not in PUBLIC_ROLES:
         raise HTTPException(409, "new_account_needs_role")
-    pid = uid("USR")
+    pid = str(uid("USR"))
     profile = {
-        "id": pid, "email": email, "mobile": body.mobile, "password_hash": None, "role": role,
+        "id": pid,
+        "email": email,
+        "mobile": body.mobile,
+        "password_hash": None,
+        "role": role,
         "full_name": (body.full_name or claims.get("name") or email.split("@")[0]).strip(),
-        "state": body.state, "district": body.district, "language": body.preferred_language,
-        "org_id": None, "status": "active",
-        "verified_at": NOW(), "created_at": NOW(),
-        "auth_provider": "google", "avatar_url": claims.get("picture"),
+        "state": body.state,
+        "district": body.district,
+        "language": body.preferred_language,
+        "org_id": None,
+        "status": "active",
+        "verified_at": NOW(),
+        "created_at": NOW(),
+        "auth_provider": "google",
+        "avatar_url": claims.get("picture"),
         "google_sub": claims.get("sub"),
     }
     db.insert("profiles", profile)
     if role == "sender":
-        db.insert("sender_profiles", {"profile_id": pid, "account_kind": "individual",
-                                      "village": body.village, "created_at": NOW()})
+        db.insert(
+            "sender_profiles",
+            {
+                "profile_id": pid,
+                "account_kind": "individual",
+                "village": body.village,
+                "created_at": NOW(),
+            },
+        )
     else:
-        db.insert("transporter_profiles", {"profile_id": pid, "company_name": profile["full_name"],
-                                           "fleet_size": 0, "verification_status": "pending",
-                                           "rating": 0, "created_at": NOW()})
+        db.insert(
+            "transporter_profiles",
+            {
+                "profile_id": pid,
+                "company_name": profile["full_name"],
+                "fleet_size": 0,
+                "verification_status": "pending",
+                "rating": 0,
+                "created_at": NOW(),
+            },
+        )
     notify(pid, "Welcome to CARGOX", "Your Google account is linked. Complete your profile to start.")
-    audit({"id": pid, "role": role}, "account.register_google", entity_type="profile",
-          entity_id=pid, after={"role": role}, ip=request.client.host if request.client else None)
-    return {"token": create_token(pid, role), "user": _public(profile),
-            "redirect": f"/{role}", "created": True}
+    audit(
+        {"id": pid, "role": role},
+        "account.register_google",
+        entity_type="profile",
+        entity_id=pid,
+        after={"role": role},
+        ip=request.client.host if request.client else None,
+    )
+    return {
+        "token": create_token(pid, role),
+        "user": _public(profile),
+        "redirect": f"/{role}",
+        "created": True,
+    }
 
 
 @router.get("/config")
@@ -302,7 +413,10 @@ def auth_config():
         "owner_admin_emails": _owner_admins(),
         "demo_mode": False,          # no demo accounts exist anywhere in the product
         "demo_accounts": [],
-        "note": ("Google sign-in is live." if settings.GOOGLE_CLIENT_ID else
-                 "Set GOOGLE_CLIENT_ID + NEXT_PUBLIC_GOOGLE_CLIENT_ID to enable Google sign-in. "
-                 "Email + password works now."),
+        "note": (
+            "Google sign-in is live."
+            if settings.GOOGLE_CLIENT_ID
+            else "Set GOOGLE_CLIENT_ID + NEXT_PUBLIC_GOOGLE_CLIENT_ID to enable Google sign-in. "
+            "Email + password works now."
+        ),
     }
