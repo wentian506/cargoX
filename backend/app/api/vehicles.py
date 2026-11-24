@@ -368,7 +368,8 @@ def verify_transporter(transporter_id: str, payload: dict, principal: Principal 
 def my_performance(principal: Principal = Depends(transporter_only)):
     tid = _str_id(principal.get("id"))
     rows = db.q(
-        """select t.*, ta.revenue, ta.distance_km, ta.vehicle_id, v.vehicle_class
+        """select t.*, ta.revenue, coalesce(t.distance_km, 0) as distance_km,
+                  ta.vehicle_id, v.vehicle_class
            from trips t join transport_assignments ta on ta.id = t.assignment_id
            left join vehicles v on v.id = ta.vehicle_id
            where ta.transporter_id = ? order by t.created_at desc""",

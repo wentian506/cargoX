@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api", tags=["transporters-ops"])
 
 
 def _tid(principal: Principal) -> str:
-    return str(principal["id"])
+    return str(principal.get("id") or "")
 
 
 def _is_postgres() -> bool:
@@ -161,7 +161,8 @@ def assignment_arrival(assignment_id: str, principal: Principal = Depends(transp
 def my_trips(principal: Principal = Depends(transporter_only)):
     tid = _tid(principal)
     trips = db.q(
-        """select t.*, ta.revenue, ta.distance_km, ta.status as assignment_status, v.reg_no, v.vehicle_class
+        """select t.*, ta.revenue, coalesce(t.distance_km, 0) as distance_km,
+                  ta.status as assignment_status, v.reg_no, v.vehicle_class
            from trips t join transport_assignments ta on ta.id = t.assignment_id
            left join vehicles v on v.id = t.vehicle_id
            where ta.transporter_id = ? order by t.created_at desc""",
@@ -170,6 +171,9 @@ def my_trips(principal: Principal = Depends(transporter_only)):
     for t in trips:
         trip_id = str(t["id"])
         t["id"] = trip_id
+        t["assignment_id"] = str(t["assignment_id"]) if t.get("assignment_id") is not None else None
+        t["distance_km"] = float(t.get("distance_km") or 0)
+        t["revenue"] = float(t.get("revenue") or 0)
         t["shipments"] = db.q(
             """select s.id, s.code, s.commodity, s.quantity_kg, s.status, s.pickup_village,
                       s.destination_name, s.pickup_lat, s.pickup_lng
@@ -178,7 +182,7 @@ def my_trips(principal: Principal = Depends(transporter_only)):
         )
         t["legs"] = db.q("select * from trip_legs where trip_id = ? order by leg_no", (trip_id,))
         t["next_action"] = _next_action(t.get("status") or "planned")
-        t["arrival"] = arrival.clock_for(str(t["assignment_id"])) if t.get("assignment_id") else None
+        t["arrival"] = arrival.clock_for(t["assignment_id"]) if t.get("assignment_id") else None
     return {"items": trips}
 
 
