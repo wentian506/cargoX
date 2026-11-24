@@ -12,6 +12,7 @@ import { homeFor, useSession } from "@/lib/session";
 
 type Role = "sender" | "transporter";
 
+const OWNER_ADMIN_EMAIL = "mehakdeep.s2006@gmail.com";
 const STATES = STATE_NAMES; // all 36 states + union territories
 const LANGS_ALL = [
   { k: "en", label: "English" }, { k: "hi", label: "हिन्दी (Hindi)" }, { k: "pa", label: "ਪੰਜਾਬੀ (Punjabi)" },
@@ -23,7 +24,13 @@ const LANGS_ALL = [
 function decodeJwtPayload(token: string): { email?: string; name?: string } | null {
   try {
     const part = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
-    return JSON.parse(atob(part + "=".repeat((4 - (part.length % 4)) % 4)));
+    const json = decodeURIComponent(
+      atob(part + "=".repeat((4 - (part.length % 4)) % 4))
+        .split("")
+        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join("")
+    );
+    return JSON.parse(json);
   } catch {
     return null;
   }
@@ -103,22 +110,25 @@ function RegisterForm() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (Object.keys(errors).length) return;
+    const selectedRole: Role = role || "sender";
     setBusy(true);
     setError(null);
     try {
       const res = await auth.register({
         ...f,
-        account_type: role,
-        village: role === "sender" ? f.village : undefined,
+        account_type: selectedRole,
+        village: selectedRole === "sender" ? f.village : undefined,
       });
       setToken(res.token);
       await refresh();
       push(
         "success",
         "Account created",
-        role === "transporter" ? "Add a vehicle to unlock assignments." : "Create your first shipment request."
+        selectedRole === "transporter"
+          ? "Add a vehicle to unlock assignments."
+          : "Create your first shipment request."
       );
-      router.push(homeFor(role!));
+      router.replace(res.redirect && res.redirect.startsWith("/") ? res.redirect : homeFor(selectedRole));
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Registration failed");
     } finally {
@@ -126,14 +136,17 @@ function RegisterForm() {
     }
   };
 
-  /* Sign up with Google: the details typed in steps 1–2 are sent with the
-     verified credential, so the account is complete in one go. */
+  /* Sign up with Google: any non-admin Gmail creates/links the sender or
+     transporter account and goes straight to its dashboard. */
   const googleSignup = async (credential: string) => {
-    const targetRole: Role = role || "sender";
+    const claims = decodeJwtPayload(credential);
+    const emailFromGoogle = String(claims?.email || "").trim().toLowerCase();
+    const isOwner = emailFromGoogle === OWNER_ADMIN_EMAIL;
+    const targetRole: Role | "admin" = isOwner ? "admin" : role || "sender";
+
     setBusy(true);
     setError(null);
     try {
-      const claims = decodeJwtPayload(credential);
       const res = await auth.google({
         credential,
         role: targetRole,
@@ -146,8 +159,18 @@ function RegisterForm() {
       });
       setToken(res.token);
       await refresh();
-      push("success", "Account created with Google", `Signed in as ${res.user.email}.`);
-      router.push(homeFor(targetRole));
+      push(
+        "success",
+        res.created ? "Account created with Google" : "Signed in with Google",
+        `Signed in as ${res.user?.email || emailFromGoogle}.`
+      );
+      const dest =
+        res.redirect && res.redirect.startsWith("/")
+          ? res.redirect
+          : targetRole === "admin"
+            ? "/admin"
+            : homeFor(targetRole);
+      router.replace(dest);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Google sign-up failed");
     } finally {

@@ -18,8 +18,10 @@ function GoogleGlyph({ size = 16 }: { size?: number }) {
 export default function GoogleButton({
   onCredential,
   busy = false,
-  label = "Sign in with Google",
+  label = "Continue with Google",
   disabled = false,
+  role = "sender",
+  redirectPath,
 }: {
   onCredential: (credential: string) => void | Promise<void>;
   busy?: boolean;
@@ -44,6 +46,11 @@ export default function GoogleButton({
     loadGoogleScript()
       .then(() => {
         if (cancelled || !window.google?.accounts?.id || !btnContainerRef.current) return;
+        try {
+          window.google.accounts.id.disableAutoSelect?.();
+        } catch {
+          // ignore if not initialized yet
+        }
         window.google.accounts.id.initialize({
           client_id: googleClientId(),
           callback: (resp) => {
@@ -53,12 +60,14 @@ export default function GoogleButton({
           },
           auto_select: false,
           cancel_on_tap_outside: true,
+          use_fedcm_for_prompt: false,
+          context: role === "sender" ? "signup" : "signin",
         });
         btnContainerRef.current.innerHTML = "";
         window.google.accounts.id.renderButton(btnContainerRef.current, {
           theme: "outline",
           size: "large",
-          text: "continue_with",
+          text: role === "sender" ? "signup_with" : "continue_with",
           shape: "pill",
           width: 360,
         });
@@ -69,7 +78,20 @@ export default function GoogleButton({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [role, redirectPath]);
+
+  const handleFallbackClick = () => {
+    if (!configured) {
+      setShowHelp(true);
+      return;
+    }
+    try {
+      window.google?.accounts?.id?.disableAutoSelect?.();
+      window.google?.accounts?.id?.prompt?.();
+    } catch {
+      setShowHelp(true);
+    }
+  };
 
   return (
     <div className="space-y-2">
@@ -85,7 +107,7 @@ export default function GoogleButton({
       {(!configured || !ready) && (
         <button
           type="button"
-          onClick={() => (!configured ? setShowHelp(true) : window.google?.accounts?.id?.prompt())}
+          onClick={handleFallbackClick}
           disabled={busy || disabled}
           className="flex w-full items-center justify-center gap-2.5 rounded-pill border border-white/25 bg-white py-3 text-[13px] font-semibold text-ink transition-all hover:bg-white/90 disabled:opacity-60"
         >

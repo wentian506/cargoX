@@ -27,7 +27,10 @@ function resolveDashboardRoute(user: any, selectedRole: Role | null, nextParam: 
     return "/admin";
   }
 
-  const resolvedRole = (user?.role || selectedRole || "sender") as Role;
+  const rawRole = String(user?.role || selectedRole || "sender").toLowerCase();
+  const resolvedRole: Role =
+    rawRole === "transporter" ? "transporter" : rawRole === "admin" ? "admin" : "sender";
+
   if (nextParam && nextParam.startsWith("/") && !nextParam.startsWith("/admin")) {
     return nextParam;
   }
@@ -103,13 +106,21 @@ function LoginInner() {
       }
 
       push("success", `Welcome back, ${String(user?.full_name || "there").split(" ")[0]}`);
-      await refresh(); // resolve the session before the guard runs
+      await refresh();
 
-      const target = resolveDashboardRoute(user, role, params.get("next"));
+      const target = resRedirect(user, role, params.get("next"));
       router.replace(target);
     },
     [params, push, refresh, role, router]
   );
+
+  function resRedirect(user: any, selectedRole: Role | null, nextParam: string | null): string {
+    if (user?.redirect && typeof user.redirect === "string" && user.redirect.startsWith("/")) {
+      if (isAllowedAdminEmail(user?.email)) return "/admin";
+      if (!user.redirect.startsWith("/admin")) return user.redirect;
+    }
+    return resolveDashboardRoute(user, selectedRole, nextParam);
+  }
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault();
@@ -130,7 +141,7 @@ function LoginInner() {
         return;
       }
       setToken(res.token);
-      await finish(res.user);
+      await finish({ ...res.user, redirect: res.redirect });
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not sign in");
     } finally {
@@ -154,7 +165,9 @@ function LoginInner() {
 
       const targetRole: Role = isAllowedAdminEmail(emailFromGoogle)
         ? "admin"
-        : role || "sender";
+        : role === "transporter"
+          ? "transporter"
+          : "sender";
 
       try {
         const res = await auth.google({
@@ -171,7 +184,7 @@ function LoginInner() {
         }
 
         setToken(res.token);
-        await finish(res.user);
+        await finish({ ...res.user, redirect: res.redirect });
       } catch (err) {
         const msg = err instanceof ApiError ? err.message : "";
         if (msg === "new_account_needs_role") {
@@ -193,9 +206,15 @@ function LoginInner() {
   );
 
   const createWithGoogle = async () => {
-    if (!pendingCredential || !role) return;
+    if (!pendingCredential) return;
 
-    if (role === "admin" && !isAllowedAdminEmail(googleEmail)) {
+    const effectiveRole: Role = isAllowedAdminEmail(googleEmail)
+      ? "admin"
+      : role === "transporter"
+        ? "transporter"
+        : "sender";
+
+    if (effectiveRole === "admin" && !isAllowedAdminEmail(googleEmail)) {
       setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
       return;
     }
@@ -205,14 +224,14 @@ function LoginInner() {
     try {
       const res = await auth.google({
         credential: pendingCredential,
-        role,
+        role: effectiveRole,
         full_name: gName.trim() || undefined,
         state: gState || undefined,
         district: gDistrict || undefined,
       });
 
       const returnedEmail = normalizeEmail(res.user?.email || googleEmail);
-      if ((role === "admin" || res.user?.role === "admin") && !isAllowedAdminEmail(returnedEmail)) {
+      if ((effectiveRole === "admin" || res.user?.role === "admin") && !isAllowedAdminEmail(returnedEmail)) {
         setToken("");
         setError(`Admin access is restricted strictly to ${ALLOWED_ADMIN_EMAIL}.`);
         return;
@@ -220,7 +239,7 @@ function LoginInner() {
 
       setToken(res.token);
       push("success", "Google account linked", `Signed in as ${res.user.email}.`);
-      await finish(res.user);
+      await finish({ ...res.user, redirect: res.redirect });
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not link this Google account");
     } finally {
@@ -234,7 +253,7 @@ function LoginInner() {
     setError(null);
   };
 
-  const roleLabel = ROLES.find((r) => r.id === role)?.label;
+  const roleLabel = ROLES.find((r) => r.id === role)?.label || "Sender";
   const displayedAdmins = ownerAdmins.length ? ownerAdmins : [ALLOWED_ADMIN_EMAIL];
 
   return (
@@ -598,7 +617,7 @@ function LoginInner() {
 }
 
 /** Read the (unverified) payload of a Google ID token — display only. The
- *  backend re-verifies signature, issuer, audience and expiry. */
+ * backend re-verifies signature, issuer, audience and expiry. */
 function decodeJwtPayload(token: string): { email?: string; name?: string } | null {
   try {
     const part = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
