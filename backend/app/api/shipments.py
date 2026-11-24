@@ -53,6 +53,7 @@ class ShipmentIn(BaseModel):
     drop_district: str | None = None
     destination_id: str | None = None
     destination_name: str | None = None
+    destination_point: str | None = None
     dest_lat: float | None = None
     dest_lng: float | None = None
     destination_options: list[dict] = Field(default_factory=list)
@@ -99,35 +100,15 @@ def _wkt_point(lat: float | None, lng: float | None, fallback: tuple[float, floa
     return f"SRID=4326;POINT({use_lng} {use_lat})"
 
 
-def _insert_shipment_safe(row: dict, pickup_wkt: str, dest_wkt: str) -> None:
-    try:
-        db.insert("shipments", row)
-        return
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "invalid geometry" not in msg and "geometry" not in msg:
-            raise
-
-    # Retry 1: replace string values on location/geometry-like fields with WKT POINTs
-    wkt_retry = dict(row)
-    for k, v in list(wkt_retry.items()):
-        if isinstance(v, str) and k not in ("id", "code", "sender_id", "status", "unit", "direction"):
-            if "dest" in k or "drop" in k:
-                wkt_retry[k] = dest_wkt
-            elif "pickup" in k or "geom" in k or "location" in k or "point" in k:
-                wkt_retry[k] = pickup_wkt
-    try:
-        db.insert("shipments", wkt_retry)
-        return
-    except Exception:
-        pass
-
-    # Retry 2: clear non-essential string fields that a geometry column may be rejecting
-    null_retry = dict(row)
-    for k, v in list(null_retry.items()):
-        if isinstance(v, str) and k not in ("id", "code", "sender_id", "status", "commodity"):
-            null_retry[k] = None
-    db.insert("shipments", null_retry)
+def _format_destination_point(body: ShipmentIn, dlat: float | None, dlng: float | None) -> str:
+    if body.destination_point and body.destination_point.strip():
+        return body.destination_point.strip()
+    if dlat is not None and dlng is not None:
+        return _wkt_point(dlat, dlng)
+    parts = [p.strip() for p in (body.destination_name, body.drop_district, body.drop_state) if p and p.strip()]
+    if parts:
+        return _wkt_point(body.pickup_lat, body.pickup_lng)
+    return _wkt_point(body.pickup_lat, body.pickup_lng)
 
 
 @router.post("/shipments")
@@ -149,49 +130,45 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
     dest = (dlat, dlng) if dlat and dlng else None
     estimate = _estimate_freight(qty, (body.pickup_lat, body.pickup_lng), dest)
     pickup_point_val = _format_pickup_point(body)
-    pickup_wkt = _wkt_point(body.pickup_lat, body.pickup_lng)
-    dest_wkt = _wkt_point(dlat, dlng, fallback=(body.pickup_lat, body.pickup_lng))
+    destination_point_val = _format_destination_point(body, dlat, dlng)
 
-    _insert_shipment_safe(
-        {
-            "id": sid,
-            "code": code,
-            "sender_id": principal["id"],
-            "commodity": body.commodity.strip().lower(),
-            "quantity_kg": qty,
-            "unit": body.unit,
-            "pickup_village": body.pickup_village,
-            "pickup_point": pickup_point_val,
-            "pickup_district": body.pickup_district,
-            "pickup_lat": body.pickup_lat,
-            "pickup_lng": body.pickup_lng,
-            "pickup_state": body.pickup_state,
-            "drop_state": body.drop_state,
-            "drop_district": body.drop_district,
-            "destination_id": did,
-            "destination_name": dname,
-            "dest_lat": dlat,
-            "dest_lng": dlng,
-            "ready_from": body.ready_from,
-            "ready_to": body.ready_to,
-            "deadline": body.deadline,
-            "packaging": body.packaging,
-            "handling": body.handling,
-            "temperature": body.temperature,
-            "special_instructions": body.special_instructions,
-            "attachments": db.jdump(body.attachments),
-            "requirements": (body.requirements or "").strip()[:600] or None,
-            "status": status,
-            "freight_estimate": estimate,
-            "freight_approved": False,
-            "direction": "outbound",
-            "is_synthetic": True,
-            "created_at": now,
-            "updated_at": now,
-        },
-        pickup_wkt=pickup_wkt,
-        dest_wkt=dest_wkt,
-    )
+    db.insert("shipments", {
+        "id": sid,
+        "code": code,
+        "sender_id": principal["id"],
+        "commodity": body.commodity.strip().lower(),
+        "quantity_kg": qty,
+        "unit": body.unit,
+        "pickup_village": body.pickup_village,
+        "pickup_point": pickup_point_val,
+        "pickup_district": body.pickup_district,
+        "pickup_lat": body.pickup_lat,
+        "pickup_lng": body.pickup_lng,
+        "pickup_state": body.pickup_state,
+        "drop_state": body.drop_state,
+        "drop_district": body.drop_district,
+        "destination_id": did,
+        "destination_name": dname,
+        "destination_point": destination_point_val,
+        "dest_lat": dlat,
+        "dest_lng": dlng,
+        "ready_from": body.ready_from,
+        "ready_to": body.ready_to,
+        "deadline": body.deadline,
+        "packaging": body.packaging,
+        "handling": body.handling,
+        "temperature": body.temperature,
+        "special_instructions": body.special_instructions,
+        "attachments": db.jdump(body.attachments),
+        "requirements": (body.requirements or "").strip()[:600] or None,
+        "status": status,
+        "freight_estimate": estimate,
+        "freight_approved": False,
+        "direction": "outbound",
+        "is_synthetic": True,
+        "created_at": now,
+        "updated_at": now,
+    })
 
     if not body.items:
         try:
@@ -343,15 +320,16 @@ def update_shipment(shipment_id: str, body: ShipmentIn, principal: Principal = D
     before = shipment_view(row)
     qty = body.quantity_kg * (100 if body.unit == "quintal" else 1000 if body.unit == "tonne" else 1)
     pickup_point_val = _format_pickup_point(body)
+    destination_point_val = _format_destination_point(body, body.dest_lat, body.dest_lng)
     db.execute(
         """update shipments set commodity = ?, quantity_kg = ?, pickup_village = ?, pickup_point = ?,
-           pickup_lat = ?, pickup_lng = ?, destination_name = ?, dest_lat = ?, dest_lng = ?,
+           pickup_lat = ?, pickup_lng = ?, destination_name = ?, destination_point = ?, dest_lat = ?, dest_lng = ?,
            ready_from = ?, ready_to = ?, deadline = ?, packaging = ?, handling = ?, temperature = ?,
            special_instructions = ?, status = ?, updated_at = ? where id = ?""",
         (
             body.commodity, qty, body.pickup_village, pickup_point_val, body.pickup_lat,
-            body.pickup_lng, body.destination_name, body.dest_lat, body.dest_lng, body.ready_from,
-            body.ready_to, body.deadline, body.packaging, body.handling, body.temperature,
+            body.pickup_lng, body.destination_name, destination_point_val, body.dest_lat, body.dest_lng,
+            body.ready_from, body.ready_to, body.deadline, body.packaging, body.handling, body.temperature,
             body.special_instructions,
             "pending_admin_review" if row["status"] == "draft" else row["status"],
             NOW(), shipment_id,
