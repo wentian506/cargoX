@@ -38,13 +38,47 @@ def _owner_admins() -> list[str]:
     return configured
 
 
+def _is_owner_admin(email: str | None) -> bool:
+    return (email or "").strip().lower() in _owner_admins()
+
+
 def _promote_if_owner(row: dict) -> dict:
     """An owner address always resolves to the Admin role."""
     user_id = str(row["id"])
-    if (row.get("email") or "").strip().lower() in _owner_admins() and row.get("role") != "admin":
+    if _is_owner_admin(row.get("email")) and row.get("role") != "admin":
         db.execute("update profiles set role = 'admin' where id = ?", (user_id,))
         row["role"] = "admin"
     return row
+
+
+def _ensure_role_profile(user_id: str, role: str, full_name: str, village: str | None = None) -> None:
+    """Ensure a role-specific sub-profile exists for sender or transporter."""
+    if role == "sender":
+        existing = db.one("select profile_id from sender_profiles where profile_id = ?", (user_id,))
+        if not existing:
+            db.insert(
+                "sender_profiles",
+                {
+                    "profile_id": user_id,
+                    "account_kind": "individual",
+                    "village": village,
+                    "created_at": NOW(),
+                },
+            )
+    elif role == "transporter":
+        existing = db.one("select profile_id from transporter_profiles where profile_id = ?", (user_id,))
+        if not existing:
+            db.insert(
+                "transporter_profiles",
+                {
+                    "profile_id": user_id,
+                    "company_name": full_name,
+                    "fleet_size": 0,
+                    "verification_status": "pending",
+                    "rating": 0,
+                    "created_at": NOW(),
+                },
+            )
 
 
 class RegisterIn(BaseModel):
@@ -291,8 +325,9 @@ def google_sign_in(body: GoogleIn, request: Request):
     """Sign in (or create an account) from a Google ID token.
 
     The token is verified against Google's public keys — audience, issuer and
-    expiry are all checked, so a forged token is rejected. A brand-new Google
-    user must choose Sender or Transporter; Admin stays invite-only.
+    expiry are all checked, so a forged token is rejected. Any non-owner email
+    signing in via the sender or transporter section is routed directly to
+    /sender or /transporter.
     """
     claims = verify_google_id_token(body.credential, settings.GOOGLE_CLIENT_ID)
     if not claims:
@@ -309,18 +344,31 @@ def google_sign_in(body: GoogleIn, request: Request):
         if domain not in settings.GOOGLE_ALLOWED_DOMAINS:
             raise HTTPException(403, f"Sign-in is restricted to {', '.join(settings.GOOGLE_ALLOWED_DOMAINS)}")
 
+    requested_role = (body.role or "").strip().lower() or None
     row = db.one("select * from profiles where lower(email) = ?", (email,))
-    # an owner address that already has a profile (seeded, or added later) always
-    # resolves to Admin; a brand-new owner address is refused like any unknown
-    # address until the profile exists, so nobody can mint an admin by sign-in
+
     if row:
         row = _promote_if_owner(dict(row))
         user_id = str(row["id"])
         user_role = str(row["role"])
         if row["status"] != "active":
             raise HTTPException(403, "This account is suspended. Contact support.")
-        if body.role and body.role != user_role:
+
+        # For any Gmail ID other than owner admin, allow direct entry to the
+        # selected public dashboard (sender or transporter) when requested.
+        if not _is_owner_admin(email) and requested_role in PUBLIC_ROLES and user_role != requested_role:
+            db.execute("update profiles set role = ? where id = ?", (requested_role, user_id))
+            user_role = requested_role
+            row["role"] = requested_role
+            _ensure_role_profile(
+                user_id,
+                requested_role,
+                str(row.get("full_name") or claims.get("name") or email.split("@")[0]),
+                body.village,
+            )
+        elif requested_role and requested_role != user_role and _is_owner_admin(email):
             raise HTTPException(409, f"This email is registered as {user_role.title()}.")
+
         db.execute(
             "update profiles set last_login_at = ?, google_sub = coalesce(google_sub, ?) where id = ?",
             (NOW(), claims.get("sub"), user_id),
@@ -339,17 +387,19 @@ def google_sign_in(body: GoogleIn, request: Request):
             "created": False,
         }
 
-    role = (body.role or "").lower()
-    if role not in PUBLIC_ROLES:
+    role = requested_role if requested_role in PUBLIC_ROLES else None
+    if not role:
         raise HTTPException(409, "new_account_needs_role")
+
     pid = str(uid("USR"))
+    full_name = (body.full_name or claims.get("name") or email.split("@")[0]).strip()
     profile = {
         "id": pid,
         "email": email,
         "mobile": body.mobile,
         "password_hash": None,
         "role": role,
-        "full_name": (body.full_name or claims.get("name") or email.split("@")[0]).strip(),
+        "full_name": full_name,
         "state": body.state,
         "district": body.district,
         "language": body.preferred_language,
@@ -362,28 +412,7 @@ def google_sign_in(body: GoogleIn, request: Request):
         "google_sub": claims.get("sub"),
     }
     db.insert("profiles", profile)
-    if role == "sender":
-        db.insert(
-            "sender_profiles",
-            {
-                "profile_id": pid,
-                "account_kind": "individual",
-                "village": body.village,
-                "created_at": NOW(),
-            },
-        )
-    else:
-        db.insert(
-            "transporter_profiles",
-            {
-                "profile_id": pid,
-                "company_name": profile["full_name"],
-                "fleet_size": 0,
-                "verification_status": "pending",
-                "rating": 0,
-                "created_at": NOW(),
-            },
-        )
+    _ensure_role_profile(pid, role, full_name, body.village)
     notify(pid, "Welcome to CARGOX", "Your Google account is linked. Complete your profile to start.")
     audit(
         {"id": pid, "role": role},
