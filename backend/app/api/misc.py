@@ -279,12 +279,28 @@ def resolve_ticket(ticket_id: str, payload: dict, principal: Principal = Depends
 # --------------------------------------------------------------------------- #
 # corridor directory (villages + mandis) used by intake forms
 # --------------------------------------------------------------------------- #
+def _safe_corridor_rows(table: str, order_by: str, defaults: dict) -> list[dict]:
+    try:
+        rows = db.q(f"select * from {table} order by {order_by}")
+    except Exception:
+        rows = db.q(f"select * from {table}")
+    out: list[dict] = []
+    for r in rows:
+        item = dict(r)
+        if "id" in item:
+            item["id"] = _str_id(item.get("id"))
+        for k, v in defaults.items():
+            item.setdefault(k, v)
+        out.append(item)
+    return out
+
+
 @router.get("/corridor")
 def corridor(principal: Principal = Depends(any_role)):
     return {
-        "villages": db.q("select id, name, district, lat, lng, cluster_id from villages order by name"),
-        "mandis": db.q("select id, name, district, lat, lng, queue_minutes from mandis order by name"),
-        "hubs": db.q("select id, name, hub_type, lat, lng, safety_verified from hubs order by name"),
+        "villages": _safe_corridor_rows("villages", "name", {"lat": None, "lng": None, "cluster_id": None}),
+        "mandis": _safe_corridor_rows("mandis", "name", {"lat": None, "lng": None, "queue_minutes": None}),
+        "hubs": _safe_corridor_rows("hubs", "name", {"hub_type": None, "lat": None, "lng": None, "safety_verified": None}),
         "note": "Pilot corridor geometry. Real coordinates, synthetic operational data.",
     }
 

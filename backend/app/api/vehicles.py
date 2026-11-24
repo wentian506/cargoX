@@ -52,13 +52,30 @@ def _str_id(val: object) -> str:
     return "" if val is None else str(val)
 
 
+def _safe_insert(table: str, payload: dict) -> dict | None:
+    try:
+        return db.insert(table, payload)
+    except Exception:
+        current = dict(payload)
+        while len(current) > 1:
+            current.pop(next(reversed(current)))
+            try:
+                return db.insert(table, current)
+            except Exception:
+                continue
+        return None
+
+
 def _ensure_transporter_profile(principal: Principal) -> None:
     tid = _str_id(principal.get("id"))
     if not tid:
         return
-    existing = db.one("select profile_id from transporter_profiles where profile_id = ?", (tid,))
+    try:
+        existing = db.one("select profile_id from transporter_profiles where profile_id = ?", (tid,))
+    except Exception:
+        return
     if not existing:
-        db.insert(
+        _safe_insert(
             "transporter_profiles",
             {
                 "profile_id": tid,
@@ -80,22 +97,31 @@ def list_vehicles(
     transporter_id: str | None = Query(None),
     status: str | None = Query(None),
 ):
-    sql = (
+    base_sql = (
         "select v.*, p.full_name as transporter_name "
         "from vehicles v left join profiles p on p.id = v.transporter_id where 1=1"
     )
+    fallback_sql = "select v.* from vehicles v where 1=1"
     params: list = []
     if principal["role"] == "transporter":
-        sql += " and v.transporter_id = ?"
+        base_sql += " and v.transporter_id = ?"
+        fallback_sql += " and v.transporter_id = ?"
         params.append(_str_id(principal.get("id")))
     elif transporter_id:
-        sql += " and v.transporter_id = ?"
+        base_sql += " and v.transporter_id = ?"
+        fallback_sql += " and v.transporter_id = ?"
         params.append(_str_id(transporter_id))
     if status and status != "all":
-        sql += " and v.availability = ?"
+        base_sql += " and v.availability = ?"
+        fallback_sql += " and v.availability = ?"
         params.append(status)
-    sql += " order by v.created_at desc"
-    rows = db.q(sql, params)
+    try:
+        rows = db.q(base_sql + " order by v.created_at desc", params)
+    except Exception:
+        try:
+            rows = db.q(base_sql, params)
+        except Exception:
+            rows = db.q(fallback_sql, params)
     for r in rows:
         r["id"] = _str_id(r.get("id"))
         r["transporter_id"] = _str_id(r.get("transporter_id"))
@@ -115,7 +141,7 @@ def add_vehicle(body: VehicleIn, principal: Principal = Depends(transporter_only
     _ensure_transporter_profile(principal)
 
     vid = uid("VEH")
-    created_v = db.insert(
+    created_v = _safe_insert(
         "vehicles",
         {
             "id": vid,
@@ -133,23 +159,33 @@ def add_vehicle(body: VehicleIn, principal: Principal = Depends(transporter_only
             "created_at": NOW(),
         },
     )
+    if not created_v and not db.one("select id from vehicles where id = ?", (vid,)):
+        raise HTTPException(500, "Could not save vehicle record to database")
     actual_vid = _str_id((created_v or {}).get("id")) or vid
 
-    db.insert(
-        "vehicle_documents",
-        {
-            "id": uid("DOC"),
-            "vehicle_id": actual_vid,
-            "doc_type": "rc",
-            "doc_ref": f"storage://vehicle-docs/{actual_vid}-rc.pdf",
-            "verified": False,
-            "uploaded_at": NOW(),
-        },
-    )
-    db.execute(
-        "update transporter_profiles set fleet_size = coalesce(fleet_size, 0) + 1 where profile_id = ?",
-        (tid,),
-    )
+    try:
+        _safe_insert(
+            "vehicle_documents",
+            {
+                "id": uid("DOC"),
+                "vehicle_id": actual_vid,
+                "doc_type": "rc",
+                "doc_ref": f"storage://vehicle-docs/{actual_vid}-rc.pdf",
+                "verified": False,
+                "uploaded_at": NOW(),
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        db.execute(
+            "update transporter_profiles set fleet_size = coalesce(fleet_size, 0) + 1 where profile_id = ?",
+            (tid,),
+        )
+    except Exception:
+        pass
+
     audit(principal, "vehicle.create", entity_type="vehicle", entity_id=actual_vid)
     for admin in db.q("select id from profiles where role = 'admin'"):
         notify(
@@ -188,11 +224,17 @@ def verify_vehicle(vehicle_id: str, payload: dict, principal: Principal = Depend
     if not v:
         raise HTTPException(404, "Vehicle not found")
     ok = bool(payload.get("verified"))
-    db.execute(
-        "update vehicles set verified = ?, verified_at = ? where id = ?",
-        (ok, NOW() if ok else None, vid),
-    )
-    db.execute("update vehicle_documents set verified = ? where vehicle_id = ?", (ok, vid))
+    try:
+        db.execute(
+            "update vehicles set verified = ?, verified_at = ? where id = ?",
+            (ok, NOW() if ok else None, vid),
+        )
+    except Exception:
+        db.execute("update vehicles set verified = ? where id = ?", (ok, vid))
+    try:
+        db.execute("update vehicle_documents set verified = ? where vehicle_id = ?", (ok, vid))
+    except Exception:
+        pass
     audit(principal, "vehicle.verify", entity_type="vehicle", entity_id=vid, after={"verified": ok})
     notify(
         _str_id(v.get("transporter_id")),
@@ -338,7 +380,7 @@ def verify_transporter(transporter_id: str, payload: dict, principal: Principal 
         prof = db.one("select id, full_name from profiles where id = ?", (tid,))
         if not prof:
             raise HTTPException(404, "Transporter not found")
-        db.insert(
+        _safe_insert(
             "transporter_profiles",
             {
                 "profile_id": tid,

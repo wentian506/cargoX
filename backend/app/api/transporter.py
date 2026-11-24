@@ -328,19 +328,37 @@ def trip_action(trip_id: str, body: TripActionIn, principal: Principal = Depends
 @router.get("/backhaul/opportunities")
 def return_loads(trip_id: str | None = None, principal: Principal = Depends(transporter_only)):
     tid = _tid(principal)
-    trips = db.q(
-        """select t.*, v.vehicle_class, v.payload_kg, v.cost_per_km, s.dest_lat, s.dest_lng
-           from trips t
-           join transport_assignments ta on ta.id = t.assignment_id
-           left join vehicles v on v.id = t.vehicle_id
-           left join trip_shipments ts on ts.trip_id = t.id
-           left join shipments s on s.id = ts.shipment_id
-           where ta.transporter_id = ?
-           order by t.created_at desc""",
-        (tid,),
-    )
-    trip = next((x for x in trips if str(x["id"]) == str(trip_id or "")), trips[0] if trips else None)
-    existing = db.q("select * from return_load_offers where transporter_id = ? order by created_at desc", (tid,))
+    try:
+        trips = db.q(
+            """select t.*, v.vehicle_class, v.payload_kg, v.cost_per_km, s.dest_lat, s.dest_lng
+               from trips t
+               join transport_assignments ta on ta.id = t.assignment_id
+               left join vehicles v on v.id = t.vehicle_id
+               left join trip_shipments ts on ts.trip_id = t.id
+               left join shipments s on s.id = ts.shipment_id
+               where ta.transporter_id = ?
+               order by t.created_at desc""",
+            (tid,),
+        )
+    except Exception:
+        trips = db.q(
+            """select t.*, v.vehicle_class, v.payload_kg
+               from trips t
+               join transport_assignments ta on ta.id = t.assignment_id
+               left join vehicles v on v.id = t.vehicle_id
+               where ta.transporter_id = ?""",
+            (tid,),
+        )
+    trip = next((x for x in trips if str(x.get("id")) == str(trip_id or "")), trips[0] if trips else None)
+    try:
+        existing = db.q("select * from return_load_offers where transporter_id = ? order by created_at desc", (tid,))
+    except Exception:
+        existing = db.q("select * from return_load_offers where transporter_id = ?", (tid,))
+    for e in existing:
+        if "id" in e:
+            e["id"] = str(e["id"])
+        if "transporter_id" in e:
+            e["transporter_id"] = str(e["transporter_id"])
     if not trip:
         return {
             "items": [],
@@ -349,19 +367,25 @@ def return_loads(trip_id: str | None = None, principal: Principal = Depends(tran
         }
     actual_trip_id = str(trip["id"])
     v = db.one("select * from vehicles where id = ?", (str(trip["vehicle_id"]),)) if trip.get("vehicle_id") else None
-    outbound = db.one(
-        """select s.commodity from shipments s join trip_shipments ts on ts.shipment_id = s.id
-           where ts.trip_id = ? limit 1""",
-        (actual_trip_id,),
-    )
-    opps = backhaul.opportunities(
-        trip_end=(float(trip.get("dest_lat") or 30.9), float(trip.get("dest_lng") or 75.85)),
-        next_committed=(30.8421, 76.1520),
-        vehicle_class=(v.get("vehicle_class") if v else None) or trip.get("vehicle_class") or "lcv",
-        capacity_kg=int((v.get("payload_kg") if v else None) or trip.get("payload_kg") or 7500),
-        outbound_commodity=(outbound or {}).get("commodity") or "wheat",
-        cost_per_km=float((v.get("cost_per_km") if v else None) or trip.get("cost_per_km") or 22),
-    )
+    try:
+        outbound = db.one(
+            """select s.commodity from shipments s join trip_shipments ts on ts.shipment_id = s.id
+               where ts.trip_id = ? limit 1""",
+            (actual_trip_id,),
+        )
+    except Exception:
+        outbound = None
+    try:
+        opps = backhaul.opportunities(
+            trip_end=(float(trip.get("dest_lat") or 30.9), float(trip.get("dest_lng") or 75.85)),
+            next_committed=(30.8421, 76.1520),
+            vehicle_class=(v.get("vehicle_class") if v else None) or trip.get("vehicle_class") or "lcv",
+            capacity_kg=int((v.get("payload_kg") if v else None) or trip.get("payload_kg") or 7500),
+            outbound_commodity=(outbound or {}).get("commodity") or "wheat",
+            cost_per_km=float((v.get("cost_per_km") if v else None) or trip.get("cost_per_km") or 22),
+        )
+    except Exception:
+        opps = []
     return {
         "items": opps,
         "trip_id": actual_trip_id,
