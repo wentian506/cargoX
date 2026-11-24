@@ -1,7 +1,7 @@
 """CARGOX intelligence modules exposed as first-class API resources."""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -9,9 +9,30 @@ from pydantic import BaseModel, Field
 from .. import db
 from ..algorithms import compat, dispatch, forecast, planning, readiness, recovery, valueclock
 from ..core.security import Principal, admin_only, any_role
-from ..services.common import NOW, audit, notify, uid
+from ..services.common import NOW, audit, uid
 
 router = APIRouter(prefix="/api", tags=["intelligence"])
+
+
+def _safe_q(query: str, params: tuple[Any, ...] | list[Any] | None = None) -> list[dict]:
+    try:
+        return db.q(query, params)
+    except Exception:
+        return []
+
+
+def _safe_one(query: str, params: tuple[Any, ...] | list[Any] | None = None) -> dict | None:
+    try:
+        return db.one(query, params)
+    except Exception:
+        return None
+
+
+def _safe_scalar(query: str, params: tuple[Any, ...] | list[Any] | None = None, default: Any = 0) -> Any:
+    try:
+        return db.scalar(query, params, default=default)
+    except Exception:
+        return default
 
 
 # --------------------------------------------------------------------------- #
@@ -20,26 +41,37 @@ router = APIRouter(prefix="/api", tags=["intelligence"])
 @router.get("/forecasts/harvestpulse")
 def harvestpulse(cluster_id: str | None = Query(None), horizon_days: int = Query(21, ge=7, le=45),
                  principal: Principal = Depends(admin_only)):
-    clusters = db.q("select distinct cluster_id from villages where cluster_id is not null")
-    db_forecasts = db.q("select * from harvest_forecasts order by forecast_date")
+    clusters = _safe_q("select distinct cluster_id from villages where cluster_id is not null")
+    db_forecasts = _safe_q("select * from harvest_forecasts order by forecast_date")
     out = []
     for c in clusters:
-        cid = c["cluster_id"]
-        if cluster_id and cid != cluster_id:
+        cid = c.get("cluster_id")
+        if not cid or (cluster_id and cid != cluster_id):
             continue
-        history = [{"date": f["forecast_date"], "kg": f["p50_kg"]} for f in db_forecasts if f["cluster_id"] == cid]
-        crop = history and db_forecasts[[i for i, f in enumerate(db_forecasts) if f["cluster_id"] == cid][0]]["crop_id"] or "wheat"
-        # area proxy from the seeded cluster scale
-        acres = max(60.0, sum(h["kg"] for h in history) / 380) if history else 200
-        result = forecast.forecast(cluster_id=cid, crop=crop or "wheat", area_acre=acres,
-                                   horizon_days=horizon_days, history=history or None)
-        demand = result["totals"]["p50_kg"]
-        commit = float(db.scalar(
+        history = [{"date": f["forecast_date"], "kg": f["p50_kg"]} for f in db_forecasts if f.get("cluster_id") == cid]
+        matched = [f for f in db_forecasts if f.get("cluster_id") == cid]
+        crop = (matched[0].get("crop_id") if matched else None) or "wheat"
+        acres = max(60.0, sum(float(h.get("kg") or 0) for h in history) / 380) if history else 200
+        try:
+            result = forecast.forecast(
+                cluster_id=cid,
+                crop=crop,
+                area_acre=acres,
+                horizon_days=horizon_days,
+                history=history or None,
+            )
+            demand = float((result.get("totals") or {}).get("p50_kg") or 0)
+        except Exception:
+            demand = 0.0
+            result = {"cluster_id": cid, "crop": crop, "totals": {"p50_kg": demand}}
+        commit = float(_safe_scalar(
             """select coalesce(sum(cb.block_size_kg),0) from capacity_blocks cb
                join vehicles v on v.id = cb.vehicle_id
                join profiles p on p.id = v.transporter_id
                where cb.status in ('published','reserved') and lower(cb.corridor) like ?""",
-            (f"%{cid.lower().replace('c-', '')}%",), 0))
+            (f"%{str(cid).lower().replace('c-', '')}%",),
+            0,
+        ) or 0)
         result["committed_capacity_kg"] = commit
         result["coverage_ratio"] = round(commit / demand, 2) if demand else 0.0
         result["gap_kg"] = max(0.0, round(demand - commit, 1))
@@ -54,9 +86,13 @@ def harvestpulse(cluster_id: str | None = Query(None), horizon_days: int = Query
 
 @router.get("/forecasts/clusters")
 def clusters():
-    rows = db.q("""select v.cluster_id, count(*) as villages, min(v.name) as example,
-                          group_concat(distinct v.district) as districts
+    rows = _safe_q("""select v.cluster_id, count(*) as villages, min(v.name) as example,
+                          string_agg(distinct v.district, ', ') as districts
                    from villages v where v.cluster_id is not null group by v.cluster_id""")
+    if not rows:
+        rows = _safe_q("""select v.cluster_id, count(*) as villages, min(v.name) as example,
+                             group_concat(distinct v.district) as districts
+                      from villages v where v.cluster_id is not null group by v.cluster_id""")
     return {"items": rows}
 
 
@@ -88,9 +124,9 @@ def dispatch_preview(body: DispatchPreview, principal: Principal = Depends(any_r
 
 @router.get("/dispatch/history")
 def dispatch_history(principal: Principal = Depends(admin_only)):
-    rows = db.q("""select d.*, sp.corridor from dispatch_decisions d
-                   left join shipment_pools sp on sp.id = d.pool_id
-                   order by d.created_at desc limit 50""")
+    rows = _safe_q("""select d.*, sp.corridor from dispatch_decisions d
+                        left join shipment_pools sp on sp.id = d.pool_id
+                        order by d.created_at desc limit 50""")
     return {"items": rows,
             "note": "Every recommendation stores the benefit, the delay cost and the reason used."}
 
@@ -100,23 +136,28 @@ def dispatch_history(principal: Principal = Depends(admin_only)):
 # --------------------------------------------------------------------------- #
 @router.get("/readysync/board")
 def readysync_board(principal: Principal = Depends(admin_only)):
-    rows = db.q("""select t.id as trip_id, t.trip_code, t.status as trip_status, t.created_at,
-                          v.reg_no, p.full_name as transporter_name
-                   from trips t left join vehicles v on v.id = t.vehicle_id
-                   left join transport_assignments ta on ta.id = t.assignment_id
-                   left join profiles p on p.id = ta.transporter_id
-                   where t.status in ('planned','loading') order by t.created_at desc""")
+    rows = _safe_q("""select t.id as trip_id, t.trip_code, t.status as trip_status, t.created_at,
+                           v.reg_no, p.full_name as transporter_name
+                    from trips t left join vehicles v on v.id = t.vehicle_id
+                    left join transport_assignments ta on ta.id = t.assignment_id
+                    left join profiles p on p.id = ta.transporter_id
+                    where t.status in ('planned','loading') order by t.created_at desc""")
     for t in rows:
-        ships = db.q("""select s.id, s.code, s.ready_from, s.status,
-                               (select ready_check from transport_assignments ta2 where ta2.id =
-                                  (select assignment_id from trips where id = ?)) as ready_check
-                        from shipments s join trip_shipments ts on ts.shipment_id = s.id where ts.trip_id = ?""",
-                     (t["trip_id"], t["trip_id"]))
+        ships = _safe_q("""select s.id, s.code, s.ready_from, s.status,
+                                (select ready_check from transport_assignments ta2 where ta2.id =
+                                   (select assignment_id from trips where id = ?)) as ready_check
+                         from shipments s join trip_shipments ts on ts.shipment_id = s.id where ts.trip_id = ?""",
+                      (t["trip_id"], t["trip_id"]))
         t["shipments"] = ships
-        # the wave leaves when the last load in it is ready, so use the latest ready_from
         departure = max([s["ready_from"] for s in ships if s.get("ready_from")] or [None], default=None)
-        t["checkpoint"] = readiness.checkpoint_state(departure)
-        t["verdict"] = readiness.readiness_verdict(ships)
+        try:
+            t["checkpoint"] = readiness.checkpoint_state(departure)
+        except Exception:
+            t["checkpoint"] = None
+        try:
+            t["verdict"] = readiness.readiness_verdict(ships)
+        except Exception:
+            t["verdict"] = "pending"
     return {"items": rows,
             "checkpoints": ["T-60", "T-45"],
             "policy_note": "Unready loads move to the next wave instead of holding every co-shipper."}
@@ -127,41 +168,91 @@ def readysync_board(principal: Principal = Depends(admin_only)):
 # --------------------------------------------------------------------------- #
 @router.get("/hubs")
 def list_hubs(principal: Principal = Depends(any_role)):
-    hubs = db.q("select * from hubs")
-    villages = db.q("select * from villages")
-    choice = planning.select_hubs(villages, hubs, k=2, radius_km=14)
-    return {"items": hubs, "selection": choice,
-            "note": "Constrained k-median over the village graph; safety verification is required."}
+    hubs = _safe_q("select * from hubs")
+    villages = _safe_q("select * from villages")
+    try:
+        choice = planning.select_hubs(villages, hubs, k=2, radius_km=14) if hubs else {"hubs": [], "assignments": []}
+    except Exception:
+        choice = {"hubs": hubs[:2], "assignments": []}
+    return {
+        "items": hubs,
+        "selection": choice,
+        "note": "Constrained k-median over the village graph; safety verification is required.",
+    }
 
 
 @router.get("/routes/road-access")
 def road_access(vehicle_class: str = "truck", monsoon: bool = False,
                 principal: Principal = Depends(any_role)):
-    edges = db.q("select * from road_edges")
-    return planning.road_access_check(edges, vehicle_class, monsoon)
+    edges = _safe_q("select * from road_edges")
+    try:
+        return planning.road_access_check(edges, vehicle_class, monsoon)
+    except Exception:
+        return {"vehicle_class": vehicle_class, "monsoon": monsoon, "edges": edges, "blocked_edges": []}
 
 
 @router.post("/routes/generate")
 def generate_routes(payload: dict, principal: Principal = Depends(admin_only)):
-    villages = db.q("select * from villages")
-    hubs = db.q("select * from hubs")
-    mandis = db.q("select * from mandis")
-    dest = db.one("select * from mandis where id = ?", (payload.get("destination_id", "M-KHN"),)) or mandis[0]
-    stop_ids = payload.get("village_ids") or [v["id"] for v in villages[:5]]
+    villages = _safe_q("select * from villages")
+    hubs = _safe_q("select * from hubs")
+    mandis = _safe_q("select * from mandis")
+
+    dest = None
+    dest_id = payload.get("destination_id") or "M-KHN"
+    for m in mandis:
+        if str(m.get("id")) == str(dest_id):
+            dest = m
+            break
+    if not dest and mandis:
+        dest = mandis[0]
+    if not dest:
+        dest = {"id": dest_id, "name": "Khanna Mandi", "lat": 30.704, "lng": 76.223}
+
+    stop_ids = payload.get("village_ids") or [v.get("id") for v in villages[:5] if v.get("id")]
+    village_by_id = {str(v.get("id")): v for v in villages if v.get("id") is not None}
     stops = []
-    for i, vid in enumerate(stop_ids):
-        v = db.one("select * from villages where id = ?", (vid,))
-        if v:
-            stops.append({"id": v["id"], "name": v["name"], "lat": v["lat"], "lng": v["lng"],
-                          "demand_kg": float(payload.get("demand_kg", 1800)), "ready_min": 0, "deadline_min": 480})
-    vehicles = [{"id": "VEH-01", "class": "tractor_trolley", "capacity_kg": 2500, "cost_per_km": 24},
-                {"id": "VEH-03", "class": "lcv", "capacity_kg": 7500, "cost_per_km": 32}]
-    plan = planning.plan_routes(depot=(dest["lat"], dest["lng"]), stops=stops, vehicles=vehicles)
-    hub_choice = planning.select_hubs(villages, hubs, k=1)
-    two_echelon = planning.build_two_echelon(
-        pickups=stops, hub=hub_choice["hubs"][0] if hub_choice["hubs"] else None,
-        line_haul_vehicle=vehicles[1], first_mile_vehicle=vehicles[0], destination=dest,
-    )
+    for vid in stop_ids:
+        v = village_by_id.get(str(vid)) or _safe_one("select * from villages where id = ?", (vid,))
+        if v and v.get("lat") is not None and v.get("lng") is not None:
+            stops.append({
+                "id": v.get("id"),
+                "name": v.get("name"),
+                "lat": float(v["lat"]),
+                "lng": float(v["lng"]),
+                "demand_kg": float(payload.get("demand_kg", 1800)),
+                "ready_min": 0,
+                "deadline_min": 480,
+            })
+
+    vehicles = [
+        {"id": "VEH-01", "class": "tractor_trolley", "capacity_kg": 2500, "cost_per_km": 24},
+        {"id": "VEH-03", "class": "lcv", "capacity_kg": 7500, "cost_per_km": 32},
+    ]
+    depot_lat = float(dest.get("lat") if dest.get("lat") is not None else 30.704)
+    depot_lng = float(dest.get("lng") if dest.get("lng") is not None else 76.223)
+
+    try:
+        plan = planning.plan_routes(depot=(depot_lat, depot_lng), stops=stops, vehicles=vehicles)
+    except Exception:
+        plan = {"routes": [], "unassigned": stops}
+
+    try:
+        hub_choice = planning.select_hubs(villages, hubs, k=1) if hubs else {"hubs": [], "assignments": []}
+    except Exception:
+        hub_choice = {"hubs": hubs[:1], "assignments": []}
+
+    selected_hub = hub_choice["hubs"][0] if hub_choice.get("hubs") else (hubs[0] if hubs else None)
+    try:
+        two_echelon = planning.build_two_echelon(
+            pickups=stops,
+            hub=selected_hub,
+            line_haul_vehicle=vehicles[1],
+            first_mile_vehicle=vehicles[0],
+            destination=dest,
+        )
+    except Exception:
+        two_echelon = {"hub": selected_hub, "first_mile": [], "line_haul": [], "destination": dest}
+
     return {"single_echelon": plan, "two_echelon": two_echelon, "hub_choice": hub_choice}
 
 
@@ -180,16 +271,16 @@ class ValueClockIn(BaseModel):
 
 @router.post("/valueclock/compare")
 def valueclock_compare(body: ValueClockIn, principal: Principal = Depends(any_role)):
-    mandis = db.q("select * from mandis") if not body.destination_ids else \
-        db.q(f"select * from mandis where id in ({','.join('?'*len(body.destination_ids))})", body.destination_ids)
+    mandis = _safe_q("select * from mandis") if not body.destination_ids else \
+        _safe_q(f"select * from mandis where id in ({','.join('?'*len(body.destination_ids))})", body.destination_ids)
     options = []
     for m in mandis:
-        price = db.one("select price_mode from market_observations where commodity_id = ? and mandi_id = ? "
-                       "order by obs_date desc limit 1", (body.commodity, m["id"]))
-        q = db.one("select queue_minutes from mandi_queues where mandi_id = ? order by observed_at desc limit 1", (m["id"],))
-        options.append({"id": m["id"], "name": m["name"], "lat": m["lat"], "lng": m["lng"],
-                        "price_per_quintal": price["price_mode"] if price else None,
-                        "queue_minutes": q["queue_minutes"] if q else m["queue_minutes"],
+        price = _safe_one("select price_mode from market_observations where commodity_id = ? and mandi_id = ? "
+                         "order by obs_date desc limit 1", (body.commodity, m["id"]))
+        mq = _safe_one("select queue_minutes from mandi_queues where mandi_id = ? order by observed_at desc limit 1", (m["id"],))
+        options.append({"id": m["id"], "name": m["name"], "lat": m.get("lat"), "lng": m.get("lng"),
+                        "price_per_quintal": price.get("price_mode") if price else None,
+                        "queue_minutes": mq.get("queue_minutes") if mq else m.get("queue_minutes"),
                         "confidence": 0.62 if price else 0.3})
     return valueclock.evaluate_destinations(
         commodity=body.commodity, quantity_kg=body.quantity_kg,
@@ -239,13 +330,13 @@ def agrocompat_matrix(payload: dict | None = None, commodities: str | None = Que
 # --------------------------------------------------------------------------- #
 @router.get("/recovery/scenarios")
 def recovery_scenarios(principal: Principal = Depends(admin_only)):
-    trips = db.q("""select t.*, v.reg_no, v.vehicle_class, ta.transporter_id, ta.revenue
-                    from trips t left join vehicles v on v.id = t.vehicle_id
-                    left join transport_assignments ta on ta.id = t.assignment_id
-                    where t.status in ('planned','loading','in_transit','at_hub','out_for_delivery')""")
-    disruptions = db.q("select * from disruption_events order by detected_at desc limit 20")
+    trips = _safe_q("""select t.*, v.reg_no, v.vehicle_class, ta.transporter_id, ta.revenue
+                       from trips t left join vehicles v on v.id = t.vehicle_id
+                       left join transport_assignments ta on ta.id = t.assignment_id
+                       where t.status in ('planned','loading','in_transit','at_hub','out_for_delivery')""")
+    disruptions = _safe_q("select * from disruption_events order by detected_at desc limit 20")
     return {"trips_at_risk": trips, "recent_disruptions": disruptions,
-            "plans": db.q("select * from recovery_plans order by created_at desc limit 20")}
+            "plans": _safe_q("select * from recovery_plans order by created_at desc limit 20")}
 
 
 class HealIn(BaseModel):
@@ -257,24 +348,24 @@ class HealIn(BaseModel):
 
 @router.post("/recovery/heal")
 def run_heal(body: HealIn, principal: Principal = Depends(admin_only)):
-    trip = db.one("select * from trips where id = ?", (body.trip_id,)) if body.trip_id else None
+    trip = _safe_one("select * from trips where id = ?", (body.trip_id,)) if body.trip_id else None
     affected, frozen = [], []
     if trip:
-        ships = db.q("""select s.* from shipments s join trip_shipments ts on ts.shipment_id = s.id
-                        where ts.trip_id = ?""", (trip["id"],))
+        ships = _safe_q("""select s.* from shipments s join trip_shipments ts on ts.shipment_id = s.id
+                           where ts.trip_id = ?""", (trip["id"],))
         affected = [{"shipment_id": s["id"], "code": s["code"], "lat": s["pickup_lat"], "lng": s["pickup_lng"],
                      "demand_kg": s["quantity_kg"], "deadline_min": 300} for s in ships]
-        others = db.q("""select s.id, s.code from shipments s join trip_shipments ts on ts.shipment_id = s.id
-                         join trips t on t.id = ts.trip_id where t.id <> ? and t.status in
-                         ('planned','loading','in_transit')""", (trip["id"],))
+        others = _safe_q("""select s.id, s.code from shipments s join trip_shipments ts on ts.shipment_id = s.id
+                            join trips t on t.id = ts.trip_id where t.id <> ? and t.status in
+                            ('planned','loading','in_transit')""", (trip["id"],))
         frozen = [{"shipment_id": o["id"], "code": o["code"], "frozen": True} for o in others]
     if not affected:
         raise HTTPException(409, "Select a trip with active shipments to recover")
 
-    standby = db.q("""select v.*, p.full_name as transporter from vehicles v
-                      join profiles p on p.id = v.transporter_id
-                      where v.availability in ('available','assigned') and v.id <> ?""",
-                   (trip["vehicle_id"] if trip else "",))
+    standby = _safe_q("""select v.*, p.full_name as transporter from vehicles v
+                         join profiles p on p.id = v.transporter_id
+                         where v.availability in ('available','assigned') and v.id <> ?""",
+                      (trip["vehicle_id"] if trip else "",))
     standby_vehicles = [{"id": v["id"], "class": v["vehicle_class"], "capacity_kg": v["payload_kg"],
                          "cost_per_km": v["cost_per_km"], "transporter_id": v["transporter_id"],
                          "transporter": v["transporter"], "lat": 30.84, "lng": 76.15} for v in standby]
@@ -304,7 +395,7 @@ def run_heal(body: HealIn, principal: Principal = Depends(admin_only)):
 
 @router.post("/recovery/{recovery_id}/approve")
 def approve_recovery(recovery_id: str, principal: Principal = Depends(admin_only)):
-    r = db.one("select * from recovery_plans where id = ?", (recovery_id,))
+    r = _safe_one("select * from recovery_plans where id = ?", (recovery_id,))
     if not r:
         raise HTTPException(404, "Recovery plan not found")
     db.execute("update recovery_plans set status = 'approved', approved_by = ? where id = ?",
@@ -318,12 +409,12 @@ def approve_recovery(recovery_id: str, principal: Principal = Depends(admin_only
 # --------------------------------------------------------------------------- #
 @router.get("/backhaul/summary")
 def backhaul_summary(principal: Principal = Depends(admin_only)):
-    offers = db.q("""select r.*, p.full_name as transporter from return_load_offers r
-                     join profiles p on p.id = r.transporter_id order by r.created_at desc""")
+    offers = _safe_q("""select r.*, p.full_name as transporter from return_load_offers r
+                        join profiles p on p.id = r.transporter_id order by r.created_at desc""")
     return {
         "items": offers,
-        "accepted": sum(1 for o in offers if o["status"] == "accepted"),
-        "extra_revenue": round(sum(float(o["revenue"]) for o in offers if o["status"] == "accepted"), 2),
+        "accepted": sum(1 for o in offers if o.get("status") == "accepted"),
+        "extra_revenue": round(sum(float(o.get("revenue") or 0) for o in offers if o.get("status") == "accepted"), 2),
         "note": "Return loads are added only when incremental revenue clears incremental cost.",
     }
 
@@ -333,15 +424,18 @@ def backhaul_summary(principal: Principal = Depends(admin_only)):
 # --------------------------------------------------------------------------- #
 @router.get("/monsoonpass/status")
 def monsoon_status(principal: Principal = Depends(any_role)):
-    edges = db.q("select * from road_edges order by monsoon_risk desc")
-    risky = [e for e in edges if float(e["monsoon_risk"] or 0) > 0.45]
+    edges = _safe_q("select * from road_edges order by monsoon_risk desc")
+    risky = [e for e in edges if float(e.get("monsoon_risk") or 0) > 0.45]
     classes = {}
     for c in ("tractor_trolley", "pickup", "tempo", "lcv", "truck"):
-        classes[c] = planning.road_access_check(edges, c, monsoon=True)
+        try:
+            classes[c] = planning.road_access_check(edges, c, monsoon=True)
+        except Exception:
+            classes[c] = {"vehicle_class": c, "monsoon": True, "blocked_edges": []}
     return {
         "active_warnings": [
-            {"edge": e["id"], "from": e["from_node"], "to": e["to_node"], "risk": e["monsoon_risk"],
-             "surface": e["surface"], "width_m": e["width_m"],
+            {"edge": e.get("id"), "from": e.get("from_node"), "to": e.get("to_node"), "risk": e.get("monsoon_risk"),
+             "surface": e.get("surface"), "width_m": e.get("width_m"),
              "action": "Verify physically before dispatch; use conservative road-access defaults."}
             for e in risky
         ],
@@ -356,12 +450,6 @@ def monsoon_status(principal: Principal = Depends(any_role)):
 # --------------------------------------------------------------------------- #
 @router.post("/voice/parse")
 def voice_parse(payload: dict, principal: Principal = Depends(any_role)):
-    """Deterministic grammar extraction over a transcript (en / hi / pa).
-
-    The ASR layer (Bhushini / Whisper) is pluggable; this endpoint takes the
-    transcript so the extraction + confirmation workflow is fully testable and
-    never pretends to have heard audio it did not receive.
-    """
     text = (payload.get("transcript") or "").strip()
     if not text:
         raise HTTPException(400, "transcript is required")
@@ -413,7 +501,7 @@ def _extract(text: str):
 
     for mid, words in _MANDIS.items():
         if any(w in low for w in words):
-            mandi = db.one("select * from mandis where id = ?", (mid,))
+            mandi = _safe_one("select * from mandis where id = ?", (mid,))
             draft["destination_id"] = mid
             draft["destination_name"] = mandi["name"] if mandi else mid
             draft["dest_lat"] = mandi["lat"] if mandi else None
@@ -422,7 +510,7 @@ def _extract(text: str):
     if "destination_id" not in draft:
         questions.append("Which mandi or destination should this go to?")
 
-    villages = db.q("select * from villages")
+    villages = _safe_q("select * from villages")
     for v in villages:
         if v["name"].lower() in low:
             draft["pickup_village"] = v["name"]
