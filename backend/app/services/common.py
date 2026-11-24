@@ -1,6 +1,7 @@
 """Shared service helpers: event log, notifications, audit, view models."""
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -8,6 +9,10 @@ from typing import Any
 from .. import db
 
 NOW = lambda: datetime.now(timezone.utc).isoformat()
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def uid(prefix: str) -> str:
@@ -163,7 +168,12 @@ def shipment_view(row: dict, *, include_events: bool = False) -> dict:
 
 
 def get_shipment(shipment_id: str) -> dict | None:
-    return db.one("select * from shipments where id = ? or code = ?", (shipment_id, shipment_id))
+    if not shipment_id:
+        return None
+    val = str(shipment_id).strip()
+    if (db.dialect() or "").lower() in ("postgres", "postgresql") and not _UUID_RE.match(val):
+        return db.one("select * from shipments where code = ?", (val,))
+    return db.one("select * from shipments where id = ? or code = ?", (val, val))
 
 
 def set_status(shipment: dict, status: str, *, actor: dict | None, note: str = "") -> None:

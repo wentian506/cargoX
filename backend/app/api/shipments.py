@@ -173,7 +173,7 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
         "updated_at": now,
     })
 
-    created_row = get_shipment(code) or inserted
+    created_row = inserted or {}
     real_sid = _lookup_shipment_id(created_row, sid)
 
     if not body.items:
@@ -261,8 +261,9 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
         except Exception:
             pass
 
+    final_row = db.one("select * from shipments where id = ?", (real_sid,)) if real_sid else created_row
     return {
-        "shipment": shipment_view(get_shipment(code) or created_row),
+        "shipment": shipment_view(final_row or created_row),
         "message": f"Shipment {code} created and sent for admin verification.",
     }
 
