@@ -46,14 +46,15 @@ export default function GoogleButton({
     loadGoogleScript()
       .then(() => {
         if (cancelled || !window.google?.accounts?.id || !btnContainerRef.current) return;
+        const idApi = window.google.accounts.id as any;
         try {
-          (window.google.accounts.id as any).disableAutoSelect?.();
+          idApi.disableAutoSelect?.();
         } catch {
           // ignore if not initialized yet
         }
-        window.google.accounts.id.initialize({
+        idApi.initialize({
           client_id: googleClientId(),
-          callback: (resp) => {
+          callback: (resp: { credential?: string }) => {
             if (resp?.credential) {
               void callbackRef.current(resp.credential);
             }
@@ -86,7 +87,8 @@ export default function GoogleButton({
       return;
     }
     try {
-      (window.google?.accounts?.id as any)?.disableAutoSelect?.();
+      const idApi = window.google?.accounts?.id as any;
+      idApi?.disableAutoSelect?.();
       window.google?.accounts?.id?.prompt?.();
     } catch {
       setShowHelp(true);
