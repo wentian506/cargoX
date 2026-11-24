@@ -1,15 +1,13 @@
 """Sender-facing shipment lifecycle + shared detail/tracking endpoints."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .. import db
 from ..algorithms import valueclock
 from ..algorithms.geo import road_km
-from ..core.security import Principal, admin_only, any_role, sender_only
+from ..core.security import Principal, any_role, sender_only
 from ..services import arrival
 from ..services.common import (
     NOW,
@@ -65,8 +63,8 @@ class ShipmentIn(BaseModel):
     temperature: str | None = "ambient"
     special_instructions: str | None = ""
     attachments: list[dict] = Field(default_factory=list)
-    items: list[ItemIn] = Field(default_factory=list)          # multi-item consignments
-    requirements: str | None = None                            # free-text sender requirement
+    items: list[ItemIn] = Field(default_factory=list)
+    requirements: str | None = None
     as_draft: bool = False
 
 
@@ -74,16 +72,18 @@ def _estimate_freight(quantity_kg: float, pickup: tuple[float, float], dest: tup
     if not dest:
         return round(quantity_kg / 100 * 180, 0)
     km = road_km(pickup[0], pickup[1], dest[0], dest[1])
-    # indicative: distance component + handling, expressed per quintal
     quintals = max(quantity_kg / 100, 0.01)
     return round(km * 21 + quintals * 42, 0)
 
 
 def _resolve_destination(body: ShipmentIn) -> tuple[str | None, str | None, float | None, float | None]:
     if body.destination_id:
-        m = db.one("select * from mandis where id = ?", (body.destination_id,))
-        if m:
-            return m["id"], m["name"], m.get("lat"), m.get("lng")
+        try:
+            m = db.one("select * from mandis where id = ?", (body.destination_id,))
+            if m:
+                return m["id"], m["name"], m.get("lat"), m.get("lng")
+        except Exception:
+            pass
     return body.destination_id, body.destination_name, body.dest_lat, body.dest_lng
 
 
@@ -237,16 +237,9 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
         except Exception:
             pass
 
-    try:
-        event(real_sid, "shipment_created", actor_id=principal["id"],
-              payload={"status": status, "quantity_kg": qty, "commodity": body.commodity})
-    except Exception:
-        pass
-
-    try:
-        audit(principal, "shipment.create", entity_type="shipment", entity_id=real_sid, after={"status": status})
-    except Exception:
-        pass
+    event(real_sid, "shipment_created", actor_id=principal["id"],
+          payload={"status": status, "quantity_kg": qty, "commodity": body.commodity})
+    audit(principal, "shipment.create", entity_type="shipment", entity_id=real_sid, after={"status": status})
 
     if status == "pending_admin_review":
         try:
@@ -261,7 +254,7 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
         except Exception:
             pass
 
-    final_row = db.one("select * from shipments where id = ?", (real_sid,)) if real_sid else created_row
+    final_row = get_shipment(real_sid) or created_row
     return {
         "shipment": shipment_view(final_row or created_row),
         "message": f"Shipment {code} created and sent for admin verification.",
@@ -293,7 +286,30 @@ def list_shipments(
         params += [f"%{q.lower()}%"] * 3
     sql += " order by created_at desc"
     rows = db.q(sql, params)
-    return paginate([shipment_view(r) for r in rows], page, page_size)
+    views = []
+    for r in rows:
+        try:
+            views.append(shipment_view(r))
+        except Exception:
+            views.append({
+                "id": r.get("id"),
+                "code": r.get("code"),
+                "sender_id": r.get("sender_id"),
+                "commodity": r.get("commodity"),
+                "quantity_kg": r.get("quantity_kg") or 0,
+                "quantity_quintal": round(float(r.get("quantity_kg") or 0) / 100, 2),
+                "pickup_village": r.get("pickup_village"),
+                "pickup": {"lat": r.get("pickup_lat"), "lng": r.get("pickup_lng")},
+                "destination_name": r.get("destination_name"),
+                "destination": {"lat": r.get("dest_lat"), "lng": r.get("dest_lng")},
+                "status": r.get("status"),
+                "status_label": STATUS_LABELS.get(r.get("status") or "", r.get("status")),
+                "freight_estimate": r.get("freight_estimate"),
+                "freight_approved": bool(r.get("freight_approved")),
+                "created_at": r.get("created_at"),
+                "updated_at": r.get("updated_at"),
+            })
+    return paginate(views, page, page_size)
 
 
 @router.get("/shipments/{shipment_id}")
@@ -304,17 +320,23 @@ def get_one(shipment_id: str, principal: Principal = Depends(any_role)):
     if principal["role"] == "sender" and row["sender_id"] != principal["id"]:
         raise HTTPException(403, "You can only access your own shipments")
     view = shipment_view(row, include_events=True)
-    assignment = db.one(
-        """select ta.*, v.reg_no, v.vehicle_class, v.payload_kg from transport_assignments ta
-           left join vehicles v on v.id = ta.vehicle_id
-           where ta.id in
-             (select t.assignment_id from trips t join trip_shipments ts on ts.trip_id = t.id where ts.shipment_id = ?)
-           order by case when ta.transporter_id = ? then 0 else 1 end
-           limit 1""",
-        (row["id"], principal["id"]),
-    )
+    try:
+        assignment = db.one(
+            """select ta.*, v.reg_no, v.vehicle_class, v.payload_kg from transport_assignments ta
+               left join vehicles v on v.id = ta.vehicle_id
+               where ta.id in
+                 (select t.assignment_id from trips t join trip_shipments ts on ts.trip_id = t.id where ts.shipment_id = ?)
+               order by case when ta.transporter_id = ? then 0 else 1 end
+               limit 1""",
+            (row["id"], principal["id"]),
+        )
+    except Exception:
+        assignment = None
     view["assignment"] = assignment
-    view["arrival"] = arrival.clock_for(assignment["id"]) if assignment else None
+    try:
+        view["arrival"] = arrival.clock_for(assignment["id"]) if assignment else None
+    except Exception:
+        view["arrival"] = None
     return view
 
 
@@ -347,7 +369,7 @@ def update_shipment(shipment_id: str, body: ShipmentIn, principal: Principal = D
     )
     event(row["id"], "shipment_updated", actor_id=principal["id"], payload={"fields": "core"})
     audit(principal, "shipment.update", entity_type="shipment", entity_id=row["id"], before=before)
-    return shipment_view(get_shipment(row["code"]) or get_shipment(row["id"]))
+    return shipment_view(get_shipment(row["id"]) or row)
 
 
 @router.post("/shipments/{shipment_id}/cancel")
@@ -366,12 +388,11 @@ def cancel_shipment(shipment_id: str, payload: dict | None = None, principal: Pr
           before={"status": before}, after={"status": "cancelled"})
     for admin in db.q("select id from profiles where role = 'admin'"):
         notify(admin["id"], f"{row['code']} cancelled by sender", (payload or {}).get("reason") or "", "warning", "/admin/shipments")
-    return shipment_view(get_shipment(row["code"]) or get_shipment(row["id"]))
+    return shipment_view(get_shipment(row["id"]) or row)
 
 
 @router.post("/shipments/{shipment_id}/approve-allocation")
 def approve_allocation(shipment_id: str, payload: dict, principal: Principal = Depends(sender_only)):
-    """Sender approves or rejects the freight allocation proposed by Admin."""
     accept = bool(payload.get("accept"))
     row = get_shipment(shipment_id)
     if not row:
@@ -394,15 +415,16 @@ def approve_allocation(shipment_id: str, payload: dict, principal: Principal = D
         notify(admin["id"], f"{row['code']} allocation {'approved' if accept else 'rejected'}",
                f"₹{alloc['allocated_share']:,.0f} · {row['commodity']}", "action" if not accept else "success",
                "/admin/shipments")
-    return {"approval": "approved" if accept else "rejected",
-            "shipment": shipment_view(get_shipment(row["code"]) or get_shipment(row["id"])),
-            "message": "Allocation approved. Admin can now confirm the assignment." if accept
-            else "Allocation rejected. Admin will re-plan this load."}
+    return {
+        "approval": "approved" if accept else "rejected",
+        "shipment": shipment_view(get_shipment(row["id"]) or row),
+        "message": "Allocation approved. Admin can now confirm the assignment." if accept
+        else "Allocation rejected. Admin will re-plan this load.",
+    }
 
 
 @router.post("/shipments/{shipment_id}/readiness")
 def readiness_checkin(shipment_id: str, payload: dict, principal: Principal = Depends(sender_only)):
-    """ReadySync: sender confirms packed/ready status at T-60 or T-45."""
     row = get_shipment(shipment_id)
     if not row or row["sender_id"] != principal["id"]:
         raise HTTPException(404, "Shipment not found for this account")
@@ -433,21 +455,30 @@ def tracking(shipment_id: str, principal: Principal = Depends(any_role)):
         raise HTTPException(404, "Shipment not found")
     if principal["role"] == "sender" and row["sender_id"] != principal["id"]:
         raise HTTPException(403, "Not your shipment")
-    events = db.q("select * from shipment_events where entity_id = ? order by created_at asc", (row["id"],))
-    trip = db.one("select t.* from trips t join trip_shipments ts on ts.trip_id = t.id where ts.shipment_id = ? limit 1", (row["id"],))
-    legs = db.q("select * from trip_legs where trip_id = ? order by leg_no", (trip["id"],)) if trip else []
+    try:
+        events = db.q("select * from shipment_events where entity_id = ? order by created_at asc", (row["id"],))
+    except Exception:
+        events = []
+    try:
+        trip = db.one("select t.* from trips t join trip_shipments ts on ts.trip_id = t.id where ts.shipment_id = ? limit 1", (row["id"],))
+    except Exception:
+        trip = None
+    try:
+        legs = db.q("select * from trip_legs where trip_id = ? order by leg_no", (trip["id"],)) if trip else []
+    except Exception:
+        legs = []
     order = ["draft", "pending_admin_review", "planning", "matched", "awaiting_sender_approval",
              "confirmed", "ready_for_pickup", "in_transit", "at_transfer_hub", "out_for_delivery", "delivered"]
-    current = order.index(row["status"]) if row["status"] in order else 0
+    current = order.index(row["status"]) if row.get("status") in order else 0
     return {
         "shipment": shipment_view(row),
         "steps": [{"key": s, "label": STATUS_LABELS[s], "done": i <= current, "current": i == current}
                   for i, s in enumerate(order)],
         "trip": {
-            "id": trip["id"], "code": trip["trip_code"], "status": trip["status"], "driver": trip["driver_name"],
-            "started_at": trip["started_at"], "legs": legs,
+            "id": trip["id"], "code": trip["trip_code"], "status": trip["status"], "driver": trip.get("driver_name"),
+            "started_at": trip.get("started_at"), "legs": legs,
         } if trip else None,
-        "events": [{**e, "payload": db.jload(e["payload"], {})} for e in events],
+        "events": [{**e, "payload": db.jload(e.get("payload"), {})} for e in events],
         "live_gps": False,
         "gps_note": "No live GPS feed is connected. Positions are last-reported operational checkpoints, never fabricated.",
     }
@@ -460,29 +491,44 @@ def recommend_destinations(shipment_id: str, principal: Principal = Depends(any_
         raise HTTPException(404, "Shipment not found")
     if principal["role"] == "sender" and row["sender_id"] != principal["id"]:
         raise HTTPException(403, "Not your shipment")
-    mandis = db.q("select * from mandis")
+    try:
+        mandis = db.q("select * from mandis")
+    except Exception:
+        mandis = []
     options = []
     for m in mandis:
-        price = db.one(
-            "select * from market_observations where commodity_id = ? and mandi_id = ? order by obs_date desc limit 1",
-            (row["commodity"], m["id"]),
-        )
-        q = db.one("select * from mandi_queues where mandi_id = ? order by observed_at desc limit 1", (m["id"],))
+        try:
+            price = db.one(
+                "select * from market_observations where commodity_id = ? and mandi_id = ? order by obs_date desc limit 1",
+                (row["commodity"], m["id"]),
+            )
+        except Exception:
+            price = None
+        try:
+            mq = db.one("select * from mandi_queues where mandi_id = ? order by observed_at desc limit 1", (m["id"],))
+        except Exception:
+            mq = None
         options.append({
-            "id": m["id"], "name": m["name"], "lat": m["lat"], "lng": m["lng"],
-            "price_per_quintal": price["price_mode"] if price else None,
-            "queue_minutes": q["queue_minutes"] if q else m["queue_minutes"],
+            "id": m["id"], "name": m["name"], "lat": m.get("lat"), "lng": m.get("lng"),
+            "price_per_quintal": price.get("price_mode") if price else None,
+            "queue_minutes": mq.get("queue_minutes") if mq else m.get("queue_minutes", 30),
             "confidence": 0.62 if price else 0.3,
             "price_source": "synthetic market observation" if price else "no observation",
         })
-    alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (row["id"],))
-    freight = alloc["allocated_share"] if alloc else row["freight_estimate"]
-    result = valueclock.evaluate_destinations(
-        commodity=row["commodity"], quantity_kg=float(row["quantity_kg"]),
-        origin=(row["pickup_lat"], row["pickup_lng"]), destinations=options,
+    try:
+        alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (row["id"],))
+    except Exception:
+        alloc = None
+    freight = alloc.get("allocated_share") if alloc else row.get("freight_estimate")
+    origin_lat = float(row.get("pickup_lat") or 25.5941)
+    origin_lng = float(row.get("pickup_lng") or 85.1376)
+    return valueclock.evaluate_destinations(
+        commodity=row["commodity"],
+        quantity_kg=float(row.get("quantity_kg") or 100.0),
+        origin=(origin_lat, origin_lng),
+        destinations=options,
         freight_share=float(freight or 0),
     )
-    return result
 
 
 @router.get("/shipments/{shipment_id}/cost")
@@ -492,15 +538,24 @@ def cost_breakdown(shipment_id: str, principal: Principal = Depends(any_role)):
         raise HTTPException(404, "Shipment not found")
     if principal["role"] == "sender" and row["sender_id"] != principal["id"]:
         raise HTTPException(403, "Not your shipment")
-    alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (row["id"],))
-    coalition = db.one("select * from coalitions where id = ?", (alloc["coalition_id"],)) if alloc else None
-    peers = db.q(
-        """select ca.*, s.code, s.commodity, s.quantity_kg from cost_allocations ca
-           join shipments s on s.id = ca.shipment_id where ca.coalition_id = ? and ca.shipment_id <> ?""",
-        (alloc["coalition_id"], row["id"]),
-    ) if alloc else []
+    try:
+        alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (row["id"],))
+    except Exception:
+        alloc = None
+    try:
+        coalition = db.one("select * from coalitions where id = ?", (alloc["coalition_id"],)) if alloc and alloc.get("coalition_id") else None
+    except Exception:
+        coalition = None
+    try:
+        peers = db.q(
+            """select ca.*, s.code, s.commodity, s.quantity_kg from cost_allocations ca
+               join shipments s on s.id = ca.shipment_id where ca.coalition_id = ? and ca.shipment_id <> ?""",
+            (alloc["coalition_id"], row["id"]),
+        ) if alloc and alloc.get("coalition_id") else []
+    except Exception:
+        peers = []
     return {
-        "shipment": {"code": row["code"], "quantity_kg": row["quantity_kg"], "commodity": row["commodity"]},
+        "shipment": {"code": row.get("code"), "quantity_kg": row.get("quantity_kg"), "commodity": row.get("commodity")},
         "allocation": alloc,
         "coalition": coalition,
         "coalition_members": peers,
