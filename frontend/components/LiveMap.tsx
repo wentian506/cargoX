@@ -7,7 +7,7 @@
  * trip detail, corridor planner). It is a real interactive map built on the
  * bundled India district geometry: pan, zoom, click-to-place a pin, live GPS
  * markers with trails, and an optional Leaflet/OpenStreetMap raster layer when a
- * tile endpoint is configured (`NEXT_PUBLIC_MAP_TILES`).  With no tile endpoint
+ * tile endpoint is configured (`NEXT_PUBLIC_MAP_TILES`). With no tile endpoint
  * set it renders the vector basemap, so the sandbox preview never depends on a
  * CDN.
  */
@@ -69,22 +69,47 @@ type Feature = { properties: { d: string; s: string }; geometry: { type: string;
 
 const INDIA_BBOX: MapRect = { lngMin: 68.1, lngMax: 97.4, latMin: 6.76, latMax: 37.08 };
 
+function num(val: unknown, fallback = 0): number {
+  if (typeof val === "number") return Number.isFinite(val) ? val : fallback;
+  if (typeof val === "string" && val.trim() !== "") {
+    const n = Number(val);
+    return Number.isFinite(n) ? n : fallback;
+  }
+  return fallback;
+}
+
+function fx(val: unknown, digits = 4, fallback = 0): string {
+  return num(val, fallback).toFixed(digits);
+}
+
+function hasPair(pair: unknown): pair is [number, number] {
+  if (!Array.isArray(pair) || pair.length < 2) return false;
+  const a = num(pair[0], NaN);
+  const b = num(pair[1], NaN);
+  return Number.isFinite(a) && Number.isFinite(b);
+}
+
 function ringsOf(f: Feature): Ring[][] {
-  if (f.geometry.type === "Polygon") return f.geometry.coordinates as Ring[][];
-  return (f.geometry.coordinates as Ring[][][]).flat();
+  if (!f?.geometry) return [];
+  if (f.geometry.type === "Polygon") return (f.geometry.coordinates as Ring[][]) || [];
+  return ((f.geometry.coordinates as Ring[][][]) || []).flat();
 }
 
 function buildBasemap() {
-  const feats = (geo as any).features as Feature[];
+  const feats = ((geo as any)?.features as Feature[]) || [];
   const districts: string[] = [];
   const states = new Map<string, string[]>();
   for (const f of feats) {
-    const state = f.properties.s;
+    const state = f?.properties?.s || "India";
     if (!states.has(state)) states.set(state, []);
     for (const ring of ringsOf(f)) {
-      if (ring.length < 4) continue;
-      let d = `M${ring[0][0]},${ring[0][1]}`;
-      for (let i = 1; i < ring.length; i++) d += `L${ring[i][0]},${ring[i][1]}`;
+      if (!Array.isArray(ring) || ring.length < 4) continue;
+      if (!hasPair(ring[0])) continue;
+      let d = `M${num(ring[0][0])},${num(ring[0][1])}`;
+      for (let i = 1; i < ring.length; i++) {
+        if (!hasPair(ring[i])) continue;
+        d += `L${num(ring[i][0])},${num(ring[i][1])}`;
+      }
       districts.push(d + "Z");
       states.get(state)!.push(d + "Z");
     }
@@ -96,7 +121,7 @@ function buildBasemap() {
 }
 
 export default function LiveMap({
-  points,
+  points = [],
   edges = [],
   height = 420,
   onSelect,
@@ -149,11 +174,44 @@ export default function LiveMap({
 
   const base = useMemo(buildBasemap, []);
 
+  const safePoints = useMemo(
+    () =>
+      (Array.isArray(points) ? points : [])
+        .filter((p) => p && Number.isFinite(num(p.lat, NaN)) && Number.isFinite(num(p.lng, NaN)))
+        .map((p) => ({
+          ...p,
+          lat: num(p.lat),
+          lng: num(p.lng),
+        })),
+    [points]
+  );
+
   // Edges are [lat, lng]. Callers written against the old MapView pass [lng, lat]
   // and set `flip: true`, which swaps them back here.
   const norm = useCallback(
-    (p: [number, number], flip?: boolean): [number, number] => (flip ? [p[1], p[0]] : [p[0], p[1]]),
+    (p: [number, number], flip?: boolean): [number, number] => {
+      if (!hasPair(p)) return [28.6, 77.2];
+      const a = num(p[0]);
+      const b = num(p[1]);
+      return flip ? [b, a] : [a, b];
+    },
     []
+  );
+
+  const safeEdges = useMemo(
+    () =>
+      (Array.isArray(edges) ? edges : []).filter(
+        (e) => e && hasPair(e.from) && hasPair(e.to)
+      ),
+    [edges]
+  );
+
+  const safeTrail = useMemo(
+    () =>
+      (Array.isArray(trail) ? trail : [])
+        .filter((t) => hasPair(t))
+        .map((t) => [num(t[0]), num(t[1])] as [number, number]),
+    [trail]
   );
 
   // container measurement so 1 SVG unit === 1 CSS pixel (crisp pan/zoom maths)
@@ -171,15 +229,18 @@ export default function LiveMap({
   }, [height]);
 
   const signature = useMemo(() => {
-    const head = points.slice(0, 6).map((p) => `${p.lat.toFixed(4)},${p.lng.toFixed(4)}`).join("|");
-    return `${points.length}:${edges.length}:${trail.length}:${head}`;
-  }, [points, edges, trail]);
+    const head = safePoints
+      .slice(0, 6)
+      .map((p) => `${fx(p.lat, 4)},${fx(p.lng, 4)}`)
+      .join("|");
+    return `${safePoints.length}:${safeEdges.length}:${safeTrail.length}:${head}`;
+  }, [safePoints, safeEdges, safeTrail]);
 
   const fitRect = useCallback((): MapRect => {
     const latlngs: [number, number][] = [
-      ...points.map((p) => [p.lat, p.lng] as [number, number]),
-      ...edges.flatMap((e) => [norm(e.from, e.flip), norm(e.to, e.flip)]),
-      ...trail,
+      ...safePoints.map((p) => [p.lat, p.lng] as [number, number]),
+      ...safeEdges.flatMap((e) => [norm(e.from, e.flip), norm(e.to, e.flip)]),
+      ...safeTrail,
     ];
     if (!latlngs.length) return INDIA_BBOX;
     const lats = latlngs.map((a) => a[0]);
@@ -188,21 +249,23 @@ export default function LiveMap({
     let latMax = Math.max(...lats);
     let lngMin = Math.min(...lngs);
     let lngMax = Math.max(...lngs);
+    const pad = num(padding, 0.18);
+    const minSp = Math.max(0.05, num(minSpan, 1.1));
     const latSpan = Math.max(latMax - latMin, 0.02);
     const lngSpan = Math.max(lngMax - lngMin, 0.02);
-    latMin -= latSpan * padding;
-    latMax += latSpan * padding;
-    lngMin -= lngSpan * padding;
-    lngMax += lngSpan * padding;
+    latMin -= latSpan * pad;
+    latMax += latSpan * pad;
+    lngMin -= lngSpan * pad;
+    lngMax += lngSpan * pad;
     const h = latMax - latMin;
-    if (h < minSpan) {
-      const grow = (minSpan - h) / 2;
+    if (h < minSp) {
+      const grow = (minSp - h) / 2;
       latMin -= grow;
       latMax += grow;
     }
     const w = lngMax - lngMin;
-    if (w < minSpan) {
-      const grow = (minSpan - w) / 2;
+    if (w < minSp) {
+      const grow = (minSp - w) / 2;
       lngMin -= grow;
       lngMax += grow;
     }
@@ -216,28 +279,35 @@ export default function LiveMap({
 
   useEffect(() => {
     if (!follow) return;
-    const g = points.find((p) => p.kind === "gps" || p.live);
+    const g = safePoints.find((p) => p.kind === "gps" || p.live);
     if (!g) return;
     const span = 0.09;
-    setView({ latMin: g.lat - span, latMax: g.lat + span, lngMin: g.lng - span * 1.4, lngMax: g.lng + span * 1.4 });
-  }, [follow, points]);
+    setView({
+      latMin: g.lat - span,
+      latMax: g.lat + span,
+      lngMin: g.lng - span * 1.4,
+      lngMax: g.lng + span * 1.4,
+    });
+  }, [follow, safePoints]);
 
   const rect = view ?? fitRect();
-  const W = size.w;
-  const H = size.h;
+  const W = Math.max(100, num(size.w, 1000));
+  const H = Math.max(80, num(size.h, height));
 
   // equirectangular projection with a cos(lat) correction at the rect centre
   const project = useCallback(
     (lng: number, lat: number) => {
-      const cos = Math.cos((((rect.latMin + rect.latMax) / 2) * Math.PI) / 180);
-      const spanX = (rect.lngMax - rect.lngMin) * cos || 0.01;
-      const spanY = rect.latMax - rect.latMin || 0.01;
-      const scale = Math.min(W / spanX, H / spanY);
+      const safeLng = num(lng);
+      const safeLat = num(lat);
+      const cos = Math.cos((((rect.latMin + rect.latMax) / 2) * Math.PI) / 180) || 0.85;
+      const spanX = Math.max(0.01, (rect.lngMax - rect.lngMin) * cos);
+      const spanY = Math.max(0.01, rect.latMax - rect.latMin);
+      const scale = Math.min(W / spanX, H / spanY) || 1;
       const offX = (W - spanX * scale) / 2;
       const offY = (H - spanY * scale) / 2;
       return {
-        x: offX + (lng - rect.lngMin) * cos * scale,
-        y: H - offY - (lat - rect.latMin) * scale,
+        x: offX + (safeLng - rect.lngMin) * cos * scale,
+        y: H - offY - (safeLat - rect.latMin) * scale,
         scale,
         cos,
       };
@@ -247,15 +317,18 @@ export default function LiveMap({
 
   const unproject = useCallback(
     (px: number, py: number) => {
-      const cos = Math.cos((((rect.latMin + rect.latMax) / 2) * Math.PI) / 180);
-      const spanX = (rect.lngMax - rect.lngMin) * cos || 0.01;
-      const spanY = rect.latMax - rect.latMin || 0.01;
-      const scale = Math.min(W / spanX, H / spanY);
+      const cos = Math.cos((((rect.latMin + rect.latMax) / 2) * Math.PI) / 180) || 0.85;
+      const spanX = Math.max(0.01, (rect.lngMax - rect.lngMin) * cos);
+      const spanY = Math.max(0.01, rect.latMax - rect.latMin);
+      const scale = Math.min(W / spanX, H / spanY) || 1;
       const offX = (W - spanX * scale) / 2;
       const offY = (H - spanY * scale) / 2;
-      const lng = rect.lngMin + (px - offX) / scale / cos;
-      const lat = rect.latMin + (H - offY - py) / scale;
-      return { lat, lng };
+      const lng = rect.lngMin + (num(px) - offX) / scale / cos;
+      const lat = rect.latMin + (H - offY - num(py)) / scale;
+      return {
+        lat: Number.isFinite(lat) ? lat : 28.6,
+        lng: Number.isFinite(lng) ? lng : 77.2,
+      };
     },
     [rect, W, H]
   );
@@ -267,7 +340,7 @@ export default function LiveMap({
     const nLatMax = a.lat + (rect.latMax - a.lat) * factor;
     const nLngMin = a.lng + (rect.lngMin - a.lng) * factor;
     const nLngMax = a.lng + (rect.lngMax - a.lng) * factor;
-    if (nLatMax - nLatMin < 0.004) return; // ~400 m: stop before it pixelates
+    if (nLatMax - nLatMin < 0.004) return;
     setView({ latMin: nLatMin, latMax: nLatMax, lngMin: nLngMin, lngMax: nLngMax });
   };
 
@@ -291,10 +364,10 @@ export default function LiveMap({
     if (!drag.current) return;
     const dx = e.clientX - drag.current.x;
     const dy = e.clientY - drag.current.y;
-    const cos = Math.cos((((drag.current.rect.latMin + drag.current.rect.latMax) / 2) * Math.PI) / 180);
-    const spanX = (drag.current.rect.lngMax - drag.current.rect.lngMin) * cos || 0.01;
-    const spanY = drag.current.rect.latMax - drag.current.rect.latMin || 0.01;
-    const scale = Math.min(W / spanX, H / spanY);
+    const cos = Math.cos((((drag.current.rect.latMin + drag.current.rect.latMax) / 2) * Math.PI) / 180) || 0.85;
+    const spanX = Math.max(0.01, (drag.current.rect.lngMax - drag.current.rect.lngMin) * cos);
+    const spanY = Math.max(0.01, drag.current.rect.latMax - drag.current.rect.latMin);
+    const scale = Math.min(W / spanX, H / spanY) || 1;
     const dLng = -dx / scale / cos;
     const dLat = dy / scale;
     setView({
@@ -317,17 +390,17 @@ export default function LiveMap({
     }
   };
 
-  const selected = points.filter((p) => p.selected);
-  const trailPath = trail.length
-    ? "M" + trail.map(([la, ln]) => {
-        const p = project(ln, la);
-        return `${p.x},${p.y}`;
-      }).join("L")
+  const selected = safePoints.filter((p) => p.selected);
+  const trailPath = safeTrail.length
+    ? "M" +
+      safeTrail
+        .map(([la, ln]) => {
+          const p = project(ln, la);
+          return `${fx(p.x, 2)},${fx(p.y, 2)}`;
+        })
+        .join("L")
     : "";
 
-  // a note rendered under the map is an in-flow strip: the plot keeps the
-  // requested height and the card simply grows, so nothing overlaps the plot or
-  // the stats grid beneath it
   const plotH = height;
 
   const legendItems = (
@@ -364,222 +437,287 @@ export default function LiveMap({
         className={`relative overflow-hidden bg-[#F7F7F2] ${notePlacement === "below" ? "rounded-t-xl2" : ""}`}
         style={{ height: plotH }}
       >
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        width="100%"
-        height={plotH}
-        className={interactive ? (dragging ? "cursor-grabbing" : "cursor-crosshair") : "cursor-default"}
-        role="img"
-        aria-label="CARGOX network map"
-        onWheel={onWheel}
-        onPointerDown={onDown}
-        onPointerMove={onMove}
-        onPointerUp={onUp}
-        onPointerLeave={() => { drag.current = null; setDragging(false); }}
-      >
-        <defs>
-          <filter id="mapShadow" x="-40%" y="-40%" width="180%" height="180%">
-            <feDropShadow dx="0" dy="1.5" stdDeviation="2" floodColor="#171717" floodOpacity="0.28" />
-          </filter>
-          <linearGradient id="landFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#FBFBF6" />
-            <stop offset="100%" stopColor="#F1F1E9" />
-          </linearGradient>
-        </defs>
-        <rect x="0" y="0" width={W} height={H} fill="#F4F4EE" />
+        <svg
+          viewBox={`0 0 ${W} ${H}`}
+          width="100%"
+          height={plotH}
+          className={interactive ? (dragging ? "cursor-grabbing" : "cursor-crosshair") : "cursor-default"}
+          role="img"
+          aria-label="CARGOX network map"
+          onWheel={onWheel}
+          onPointerDown={onDown}
+          onPointerMove={onMove}
+          onPointerUp={onUp}
+          onPointerLeave={() => {
+            drag.current = null;
+            setDragging(false);
+          }}
+        >
+          <defs>
+            <filter id="mapShadow" x="-40%" y="-40%" width="180%" height="180%">
+              <feDropShadow dx="0" dy="1.5" stdDeviation="2" floodColor="#171717" floodOpacity="0.28" />
+            </filter>
+            <linearGradient id="landFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#FBFBF6" />
+              <stop offset="100%" stopColor="#F1F1E9" />
+            </linearGradient>
+          </defs>
+          <rect x="0" y="0" width={W} height={H} fill="#F4F4EE" />
 
-        {showBorders && (
-          <g>
-            {/* district polygons: enough detail to stay legible when zoomed to a
-                corridor, and the only offline boundary layer we ship */}
-            <path d={base.districts.join("")} fill="url(#landFill)" stroke="#DCDCD2" strokeWidth={0.5} />
-            <path d={base.districts.join("")} fill="none" stroke="#D3D3C6" strokeWidth={0.28} opacity={0.9} />
-            {base.states.map((s) => (
-              <path key={s.name} d={s.d} fill="none" stroke="#BDBDAE" strokeWidth={0.9} opacity={0.95} />
-            ))}
-          </g>
-        )}
+          {showBorders && (
+            <g>
+              <path d={base.districts.join("")} fill="url(#landFill)" stroke="#DCDCD2" strokeWidth={0.5} />
+              <path d={base.districts.join("")} fill="none" stroke="#D3D3C6" strokeWidth={0.28} opacity={0.9} />
+              {base.states.map((s) => (
+                <path key={s.name} d={s.d} fill="none" stroke="#BDBDAE" strokeWidth={0.9} opacity={0.95} />
+              ))}
+            </g>
+          )}
 
-        {/* graticule: latitude/longitude lines + a scale bar keep any zoom legible */}
-        {(() => {
-          const spanLat = rect.latMax - rect.latMin;
-          const spanLng = rect.lngMax - rect.lngMin;
-          const stepFor = (span: number) => {
-            const target = span / 5;
-            const opts = [0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10];
-            return opts.find((o) => o >= target) || 10;
-          };
-          const stepLat = stepFor(spanLat);
-          const stepLng = stepFor(spanLng);
-          const lines: React.ReactNode[] = [];
-          const startLat = Math.ceil(rect.latMin / stepLat) * stepLat;
-          for (let la = startLat; la <= rect.latMax; la += stepLat) {
-            const p = project(rect.lngMin, la);
-            const p2 = project(rect.lngMax, la);
-            lines.push(
-              <g key={`gla-${la.toFixed(3)}`}>
-                <line x1={p.x} y1={p.y} x2={p2.x} y2={p2.y} stroke="#171717" strokeWidth={0.5} opacity={0.09} />
-                <text x={6} y={p.y - 2} fontSize={8.5} fill="#8A8A8A" opacity={0.85}>
-                  {la.toFixed(stepLat < 0.1 ? 2 : 1)}°N
+          {/* graticule: latitude/longitude lines + a scale bar keep any zoom legible */}
+          {(() => {
+            const spanLat = Math.max(0.01, rect.latMax - rect.latMin);
+            const spanLng = Math.max(0.01, rect.lngMax - rect.lngMin);
+            const stepFor = (span: number) => {
+              const target = span / 5;
+              const opts = [0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10];
+              return opts.find((o) => o >= target) || 10;
+            };
+            const stepLat = stepFor(spanLat);
+            const stepLng = stepFor(spanLng);
+            const lines: React.ReactNode[] = [];
+            const startLat = Math.ceil(rect.latMin / stepLat) * stepLat;
+            for (let la = startLat, guard = 0; la <= rect.latMax && guard < 40; la += stepLat, guard++) {
+              const p = project(rect.lngMin, la);
+              const p2 = project(rect.lngMax, la);
+              lines.push(
+                <g key={`gla-${fx(la, 3)}-${guard}`}>
+                  <line x1={p.x} y1={p.y} x2={p2.x} y2={p2.y} stroke="#171717" strokeWidth={0.5} opacity={0.09} />
+                  <text x={6} y={p.y - 2} fontSize={8.5} fill="#8A8A8A" opacity={0.85}>
+                    {fx(la, stepLat < 0.1 ? 2 : 1)}°N
+                  </text>
+                </g>
+              );
+            }
+            const startLng = Math.ceil(rect.lngMin / stepLng) * stepLng;
+            for (let ln = startLng, guard = 0; ln <= rect.lngMax && guard < 40; ln += stepLng, guard++) {
+              const p = project(ln, rect.latMin);
+              const p2 = project(ln, rect.latMax);
+              lines.push(
+                <g key={`gln-${fx(ln, 3)}-${guard}`}>
+                  <line x1={p.x} y1={p.y} x2={p2.x} y2={p2.y} stroke="#171717" strokeWidth={0.5} opacity={0.09} />
+                  <text x={p.x + 3} y={H - 6} fontSize={8.5} fill="#8A8A8A" opacity={0.85}>
+                    {fx(ln, stepLng < 0.1 ? 2 : 1)}°E
+                  </text>
+                </g>
+              );
+            }
+            return lines;
+          })()}
+
+          {trailPath && (
+            <path d={trailPath} fill="none" stroke="#171717" strokeWidth={2.4} strokeLinecap="round" opacity={0.75} />
+          )}
+
+          {safeEdges.map((e, i) => {
+            const [aLat, aLng] = norm(e.from, e.flip);
+            const [bLat, bLng] = norm(e.to, e.flip);
+            const a = project(aLng, aLat);
+            const b = project(bLng, bLat);
+            const s = TONE_STYLE[e.tone || "road"] || TONE_STYLE.road;
+            return (
+              <g key={e.id || i}>
+                <line
+                  x1={a.x}
+                  y1={a.y}
+                  x2={b.x}
+                  y2={b.y}
+                  stroke={s.stroke}
+                  strokeWidth={s.width}
+                  strokeDasharray={e.dashed ? "6 6" : s.dash}
+                  strokeLinecap="round"
+                  opacity={e.tone === "road" || !e.tone ? 0.9 : 0.95}
+                />
+                {(e.tone === "line_haul" || e.tone === "live") && (
+                  <circle r="2.8" fill={s.stroke}>
+                    <animateMotion
+                      dur={`${3.2 + (i % 5) * 0.55}s`}
+                      repeatCount="indefinite"
+                      path={`M${fx(a.x, 2)},${fx(a.y, 2)} L${fx(b.x, 2)},${fx(b.y, 2)}`}
+                    />
+                  </circle>
+                )}
+                {e.label && (
+                  <text
+                    x={(a.x + b.x) / 2}
+                    y={(a.y + b.y) / 2 - 5}
+                    textAnchor="middle"
+                    fontSize="9.5"
+                    fill="#7A7A7A"
+                    fontWeight={600}
+                  >
+                    {e.label}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+
+          {selected.map((p, i) => {
+            const a = project(p.lng, p.lat);
+            return (
+              <circle key={`sel-${p.id}-${i}`} cx={a.x} cy={a.y} r={15 + i * 2} fill="#FFD60A" opacity={0.28}>
+                <animate attributeName="r" values="12;22;12" dur="2.6s" repeatCount="indefinite" />
+              </circle>
+            );
+          })}
+
+          {safePoints.map((p, idx) => {
+            const { x, y } = project(p.lng, p.lat);
+            const st = KIND_STYLE[p.kind] ?? KIND_STYLE.stop;
+            const isLive = Boolean(p.live || p.kind === "gps");
+            const headingDeg = p.heading !== undefined ? num(p.heading, 0) : undefined;
+            const pointName = String(p.name || "");
+            return (
+              <g
+                key={`${p.id || "pt"}-${idx}`}
+                onMouseEnter={() => setHover(p.id)}
+                onMouseLeave={() => setHover(null)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onSelect?.(p);
+                }}
+                className={onSelect ? "cursor-pointer" : ""}
+              >
+                {isLive && (
+                  <circle cx={x} cy={y} r={13} fill="#FFD60A" opacity={0.35}>
+                    <animate attributeName="r" values="8;18;8" dur="1.8s" repeatCount="indefinite" />
+                    <animate attributeName="opacity" values="0.45;0;0.45" dur="1.8s" repeatCount="indefinite" />
+                  </circle>
+                )}
+                {(p.kind === "mandi" || p.kind === "hub") && (
+                  <circle cx={x} cy={y} r={st.r + 5} fill={st.fill} opacity={0.13} />
+                )}
+                {headingDeg !== undefined && isLive ? (
+                  <g transform={`translate(${fx(x, 2)},${fx(y, 2)}) rotate(${fx(headingDeg, 1)})`}>
+                    <path
+                      d={`M0,${-st.r - 3} L${st.r},${st.r} L0,${st.r * 0.45} L${-st.r},${st.r} Z`}
+                      fill="#171717"
+                      stroke="#FFD60A"
+                      strokeWidth={1.4}
+                      filter="url(#mapShadow)"
+                    />
+                  </g>
+                ) : (
+                  <circle
+                    cx={x}
+                    cy={y}
+                    r={st.r}
+                    fill={st.fill}
+                    stroke={st.ring}
+                    strokeWidth={p.kind === "village" ? 1.6 : 2}
+                    filter={p.kind !== "village" ? "url(#mapShadow)" : undefined}
+                  />
+                )}
+                {(p.kind === "hub" || p.kind === "mandi") && (
+                  <circle cx={x} cy={y} r={st.r - 2.6} fill={p.kind === "hub" ? "#FFE873" : "#FFFFFF"} opacity={0.9} />
+                )}
+                {(hover === p.id || p.selected) && pointName && (
+                  <g transform={`translate(${fx(x + 10, 2)}, ${fx(y - 10, 2)})`} pointerEvents="none">
+                    <rect
+                      x="0"
+                      y="0"
+                      width={Math.max(84, pointName.length * 6.4)}
+                      height={p.meta ? 32 : 20}
+                      rx="6"
+                      fill="#171717"
+                      opacity="0.94"
+                    />
+                    <text x="7" y="14" fill="#FFFFFF" fontSize="10.5" fontWeight={600}>
+                      {pointName}
+                    </text>
+                    {p.meta && (
+                      <text x="7" y="25" fill="#FFD60A" fontSize="9">
+                        {p.meta}
+                      </text>
+                    )}
+                  </g>
+                )}
+              </g>
+            );
+          })}
+
+          {/* scale bar */}
+          {(() => {
+            const cos = Math.cos((((rect.latMin + rect.latMax) / 2) * Math.PI) / 180) || 0.85;
+            const spanX = Math.max(0.01, (rect.lngMax - rect.lngMin) * cos);
+            const spanY = Math.max(0.01, rect.latMax - rect.latMin);
+            const pxPerDeg = Math.min(W / spanX, H / spanY) || 1;
+            const kmPerDeg = 111.32;
+            const targetKm = pxPerDeg > 0 ? (90 / pxPerDeg) * kmPerDeg : 10;
+            const nice = [1, 2, 5, 10, 20, 25, 50, 100, 200, 500].reduce(
+              (best, k) => (Math.abs(k - targetKm) < Math.abs(best - targetKm) ? k : best),
+              500
+            );
+            const barPx = Math.max(12, (nice / kmPerDeg) * pxPerDeg);
+            return (
+              <g transform={`translate(${fx(W - barPx - 22, 2)}, 24)`}>
+                <rect x={-4} y={-11} width={barPx + 8} height={18} rx={3} fill="#FFFFFF" opacity={0.72} />
+                <line x1={0} y1={0} x2={barPx} y2={0} stroke="#171717" strokeWidth={1.6} />
+                <line x1={0} y1={-3} x2={0} y2={3} stroke="#171717" strokeWidth={1.6} />
+                <line x1={barPx} y1={-3} x2={barPx} y2={3} stroke="#171717" strokeWidth={1.6} />
+                <text x={barPx / 2} y={-4} fontSize={8.5} fill="#171717" textAnchor="middle" fontWeight={600}>
+                  {nice} km
                 </text>
               </g>
             );
-          }
-          const startLng = Math.ceil(rect.lngMin / stepLng) * stepLng;
-          for (let ln = startLng; ln <= rect.lngMax; ln += stepLng) {
-            const p = project(ln, rect.latMin);
-            const p2 = project(ln, rect.latMax);
-            lines.push(
-              <g key={`gln-${ln.toFixed(3)}`}>
-                <line x1={p.x} y1={p.y} x2={p2.x} y2={p2.y} stroke="#171717" strokeWidth={0.5} opacity={0.09} />
-                <text x={p.x + 3} y={H - 6} fontSize={8.5} fill="#8A8A8A" opacity={0.85}>
-                  {ln.toFixed(stepLng < 0.1 ? 2 : 1)}°E
-                </text>
-              </g>
-            );
-          }
-          return lines;
-        })()}
+          })()}
+        </svg>
 
-        {trailPath && (
-          <path d={trailPath} fill="none" stroke="#171717" strokeWidth={2.4} strokeLinecap="round" opacity={0.75} />
-        )}
+        {/* controls */}
+        <div className="absolute right-3 top-3 flex flex-col gap-1.5">
+          <button
+            type="button"
+            aria-label="Zoom in"
+            onClick={() => zoomBy(0.62)}
+            className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white/95 text-[17px] font-semibold text-ink shadow-sm backdrop-blur hover:bg-accent-50"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            aria-label="Zoom out"
+            onClick={() => zoomBy(1.6)}
+            className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white/95 text-[17px] font-semibold text-ink shadow-sm backdrop-blur hover:bg-accent-50"
+          >
+            −
+          </button>
+          <button
+            type="button"
+            aria-label="Fit to network"
+            onClick={() => setView(fitRect())}
+            className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white/95 text-[13px] text-ink shadow-sm backdrop-blur hover:bg-accent-50"
+          >
+            ⤢
+          </button>
+        </div>
 
-        {edges.map((e, i) => {
-          const [aLat, aLng] = norm(e.from, e.flip);
-          const [bLat, bLng] = norm(e.to, e.flip);
-          const a = project(aLng, aLat);
-          const b = project(bLng, bLat);
-          const s = TONE_STYLE[e.tone || "road"];
-          return (
-            <g key={e.id || i}>
-              <line
-                x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                stroke={s.stroke}
-                strokeWidth={s.width}
-                strokeDasharray={e.dashed ? "6 6" : s.dash}
-                strokeLinecap="round"
-                opacity={e.tone === "road" || !e.tone ? 0.9 : 0.95}
-              />
-              {(e.tone === "line_haul" || e.tone === "live") && (
-                <circle r="2.8" fill={s.stroke}>
-                  <animateMotion dur={`${3.2 + (i % 5) * 0.55}s`} repeatCount="indefinite"
-                    path={`M${a.x},${a.y} L${b.x},${b.y}`} />
-                </circle>
-              )}
-              {e.label && (
-                <text x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 5} textAnchor="middle"
-                  fontSize="9.5" fill="#7A7A7A" fontWeight={600}>{e.label}</text>
-              )}
-            </g>
-          );
-        })}
-
-        {selected.map((p, i) => {
-          const a = project(p.lng, p.lat);
-          return (
-            <circle key={`sel-${p.id}`} cx={a.x} cy={a.y} r={15 + i * 2} fill="#FFD60A" opacity={0.28}>
-              <animate attributeName="r" values="12;22;12" dur="2.6s" repeatCount="indefinite" />
-            </circle>
-          );
-        })}
-
-        {points.map((p) => {
-          const { x, y } = project(p.lng, p.lat);
-          const st = KIND_STYLE[p.kind] ?? KIND_STYLE.stop;
-          const isLive = p.live || p.kind === "gps";
-          return (
-            <g
-              key={p.id}
-              onMouseEnter={() => setHover(p.id)}
-              onMouseLeave={() => setHover(null)}
-              onClick={(e) => { e.stopPropagation(); onSelect?.(p); }}
-              className={onSelect ? "cursor-pointer" : ""}
-            >
-              {isLive && (
-                <circle cx={x} cy={y} r={13} fill="#FFD60A" opacity={0.35}>
-                  <animate attributeName="r" values="8;18;8" dur="1.8s" repeatCount="indefinite" />
-                  <animate attributeName="opacity" values="0.45;0;0.45" dur="1.8s" repeatCount="indefinite" />
-                </circle>
-              )}
-              {(p.kind === "mandi" || p.kind === "hub") && (
-                <circle cx={x} cy={y} r={st.r + 5} fill={st.fill} opacity={0.13} />
-              )}
-              {p.heading !== undefined && isLive ? (
-                <g transform={`translate(${x},${y}) rotate(${p.heading})`}>
-                  <path d={`M0,${-st.r - 3} L${st.r},${st.r} L0,${st.r * 0.45} L${-st.r},${st.r} Z`}
-                    fill="#171717" stroke="#FFD60A" strokeWidth={1.4} filter="url(#mapShadow)" />
-                </g>
-              ) : (
-                <circle cx={x} cy={y} r={st.r} fill={st.fill} stroke={st.ring}
-                  strokeWidth={p.kind === "village" ? 1.6 : 2}
-                  filter={p.kind !== "village" ? "url(#mapShadow)" : undefined} />
-              )}
-              {(p.kind === "hub" || p.kind === "mandi") && (
-                <circle cx={x} cy={y} r={st.r - 2.6} fill={p.kind === "hub" ? "#FFE873" : "#FFFFFF"} opacity={0.9} />
-              )}
-              {(hover === p.id || p.selected) && p.name && (
-                <g transform={`translate(${x + 10}, ${y - 10})`} pointerEvents="none">
-                  <rect x="0" y="0" width={Math.max(84, p.name.length * 6.4)} height={p.meta ? 32 : 20}
-                    rx="6" fill="#171717" opacity="0.94" />
-                  <text x="7" y="14" fill="#FFFFFF" fontSize="10.5" fontWeight={600}>{p.name}</text>
-                  {p.meta && <text x="7" y="25" fill="#FFD60A" fontSize="9">{p.meta}</text>}
-                </g>
-              )}
-            </g>
-          );
-        })}
-        {/* scale bar */}
-        {(() => {
-          const cos = Math.cos((((rect.latMin + rect.latMax) / 2) * Math.PI) / 180);
-          const spanX = (rect.lngMax - rect.lngMin) * cos || 0.01;
-          const spanY = rect.latMax - rect.latMin || 0.01;
-          const pxPerDeg = Math.min(W / spanX, H / spanY);
-          const kmPerDeg = 111.32;
-          const targetKm = pxPerDeg > 0 ? 90 / pxPerDeg * kmPerDeg : 10;
-          const nice = [1, 2, 5, 10, 20, 25, 50, 100, 200, 500].reduce(
-            (best, k) => (Math.abs(k - targetKm) < Math.abs(best - targetKm) ? k : best), 500
-          );
-          const barPx = (nice / kmPerDeg) * pxPerDeg;
-          return (
-            <g transform={`translate(${W - barPx - 22}, ${24})`}>
-              <rect x={-4} y={-11} width={barPx + 8} height={18} rx={3} fill="#FFFFFF" opacity={0.72} />
-              <line x1={0} y1={0} x2={barPx} y2={0} stroke="#171717" strokeWidth={1.6} />
-              <line x1={0} y1={-3} x2={0} y2={3} stroke="#171717" strokeWidth={1.6} />
-              <line x1={barPx} y1={-3} x2={barPx} y2={3} stroke="#171717" strokeWidth={1.6} />
-              <text x={barPx / 2} y={-4} fontSize={8.5} fill="#171717" textAnchor="middle" fontWeight={600}>
-                {nice} km
-              </text>
-            </g>
-          );
-        })()}
-      </svg>
-
-      {/* controls */}
-      <div className="absolute right-3 top-3 flex flex-col gap-1.5">
-        <button type="button" aria-label="Zoom in" onClick={() => zoomBy(0.62)}
-          className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white/95 text-[17px] font-semibold text-ink shadow-sm backdrop-blur hover:bg-accent-50">+</button>
-        <button type="button" aria-label="Zoom out" onClick={() => zoomBy(1.6)}
-          className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white/95 text-[17px] font-semibold text-ink shadow-sm backdrop-blur hover:bg-accent-50">−</button>
-        <button type="button" aria-label="Fit to network" onClick={() => setView(fitRect())}
-          className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white/95 text-[13px] text-ink shadow-sm backdrop-blur hover:bg-accent-50">⤢</button>
-      </div>
-
-      <div className="pointer-events-none absolute right-3 top-[118px] flex flex-col items-end gap-1.5">
-        {live && (
-          <span className="inline-flex items-center gap-1.5 rounded-pill bg-ink px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-white">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" /> Live
+        <div className="pointer-events-none absolute right-3 top-[118px] flex flex-col items-end gap-1.5">
+          {live && (
+            <span className="inline-flex items-center gap-1.5 rounded-pill bg-ink px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-white">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" /> Live
+            </span>
+          )}
+          <span className="rounded-md border border-line bg-white/90 px-2 py-1 text-[10px] text-ink-muted">
+            {liveLabel || "India basemap · OSM"}
+            {showBorders ? " · district borders" : ""}
           </span>
-        )}
-        <span className="rounded-md border border-line bg-white/90 px-2 py-1 text-[10px] text-ink-muted">
-          {liveLabel || "India basemap · OSM"}{showBorders ? " · district borders" : ""}
-        </span>
-        {cursor && (
-          <span className="rounded-md bg-ink/85 px-2 py-0.5 font-mono text-[10px] text-white">
-            {cursor.lat.toFixed(4)}, {cursor.lng.toFixed(4)}
-          </span>
-        )}
-      </div>
+          {cursor && (
+            <span className="rounded-md bg-ink/85 px-2 py-0.5 font-mono text-[10px] text-white">
+              {fx(cursor.lat, 4)}, {fx(cursor.lng, 4)}
+            </span>
+          )}
+        </div>
       </div>
 
       {legend && notePlacement === "inside" && (
@@ -592,8 +730,10 @@ export default function LiveMap({
         </div>
       )}
 
-      {!points.length && !edges.length && (
-        <div className="absolute inset-0 grid place-items-center bg-white/55 text-[13px] text-ink-muted">{emptyLabel}</div>
+      {!safePoints.length && !safeEdges.length && (
+        <div className="absolute inset-0 grid place-items-center bg-white/55 text-[13px] text-ink-muted">
+          {emptyLabel}
+        </div>
       )}
 
       {footerNote && notePlacement === "inside" && (
