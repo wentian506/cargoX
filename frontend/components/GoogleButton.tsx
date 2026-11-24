@@ -47,7 +47,7 @@ export default function GoogleButton({
       .then(() => {
         if (cancelled || !window.google?.accounts?.id || !btnContainerRef.current) return;
         try {
-          window.google.accounts.id.disableAutoSelect?.();
+          (window.google.accounts.id as any).disableAutoSelect?.();
         } catch {
           // ignore if not initialized yet
         }
@@ -86,7 +86,7 @@ export default function GoogleButton({
       return;
     }
     try {
-      window.google?.accounts?.id?.disableAutoSelect?.();
+      (window.google?.accounts?.id as any)?.disableAutoSelect?.();
       window.google?.accounts?.id?.prompt?.();
     } catch {
       setShowHelp(true);
