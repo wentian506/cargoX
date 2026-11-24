@@ -155,7 +155,10 @@ def list_senders(q: str | None = Query(None)):
                     sp.account_kind, sp.village,
                     (select count(*) from shipments s where s.sender_id = p.id) as shipments,
                     (select coalesce(sum(s.quantity_kg),0) from shipments s where s.sender_id = p.id) as volume_kg,
-                    (select coalesce(sum(s.freight_estimate),0) from shipments s where s.sender_id = p.id and s.status='delivered') as spend
+                    (select coalesce(sum(ca.allocated_share),0)
+                     from cost_allocations ca
+                     join shipments s on s.id = ca.shipment_id
+                     where s.sender_id = p.id and s.status='delivered') as spend
              from profiles p left join sender_profiles sp on sp.profile_id = p.id
              where p.role = 'sender'"""
     params: list = []
@@ -703,8 +706,8 @@ def compute_allocations(payload: dict, principal: Principal = Depends(admin_only
             "created_at": NOW(),
         })
         db.execute(
-            "update shipments set coalition_id = ?, freight_estimate = ?, status = ?, updated_at = ? where id = ?",
-            (cid, row["allocated_share"], "awaiting_sender_approval", NOW(), row["shipment_id"]),
+            "update shipments set coalition_id = ?, status = ?, updated_at = ? where id = ?",
+            (cid, "awaiting_sender_approval", NOW(), row["shipment_id"]),
         )
         shp = get_shipment(row["shipment_id"])
         event(

@@ -106,8 +106,8 @@ def verify_vehicle(vehicle_id: str, payload: dict, principal: Principal = Depend
         raise HTTPException(404, "Vehicle not found")
     ok = bool(payload.get("verified"))
     db.execute("update vehicles set verified = ?, verified_at = ? where id = ?",
-               (1 if ok else 0, NOW() if ok else None, vehicle_id))
-    db.execute("update vehicle_documents set verified = ? where vehicle_id = ?", (1 if ok else 0, vehicle_id))
+               (ok, NOW() if ok else None, vehicle_id))
+    db.execute("update vehicle_documents set verified = ? where vehicle_id = ?", (ok, vehicle_id))
     audit(principal, "vehicle.verify", entity_type="vehicle", entity_id=vehicle_id, after={"verified": ok})
     notify(v["transporter_id"], f"Vehicle {v['reg_no']} {'verified' if ok else 'rejected by Admin'}",
            "Assignments are now unlocked." if ok else "Re-upload documents and resubmit.",
@@ -198,7 +198,7 @@ def list_transporters(principal: Principal = Depends(admin_only)):
     rows = db.q("""select p.id, p.full_name, p.email, p.mobile, p.status, p.created_at,
                           tp.company_name, tp.fleet_size, tp.verification_status, tp.rating,
                           (select count(*) from vehicles v where v.transporter_id = p.id) as vehicles,
-                          (select count(*) from vehicles v where v.transporter_id = p.id and v.verified = 1) as verified_vehicles,
+                          (select count(*) from vehicles v where v.transporter_id = p.id and v.verified IS TRUE) as verified_vehicles,
                           (select count(*) from transport_assignments ta where ta.transporter_id = p.id) as assignments,
                           (select count(*) from transport_assignments ta where ta.transporter_id = p.id and ta.status = 'confirmed') as confirmed
                    from profiles p left join transporter_profiles tp on tp.profile_id = p.id
