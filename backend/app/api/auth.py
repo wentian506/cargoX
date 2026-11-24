@@ -1,6 +1,8 @@
 """Authentication: register (sender/transporter only), login, session, reset."""
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 
@@ -30,6 +32,13 @@ DEFAULT_OWNER_ADMIN = "mehakdeep.s2006@gmail.com"
 # ---------------------------------------------------------------------------
 
 
+def _new_user_id() -> str:
+    """Return a valid UUID string when backed by PostgreSQL, else prefixed uid."""
+    if (db.dialect() or "").lower() in ("postgres", "postgresql"):
+        return str(uuid.uuid4())
+    return str(uid("USR"))
+
+
 def _owner_admins() -> list[str]:
     """The invite-only Admin addresses (lower-cased) allowed to reach /admin."""
     configured = [e.strip().lower() for e in (settings.ADMIN_EMAILS or []) if e and e.strip()]
@@ -53,25 +62,26 @@ def _promote_if_owner(row: dict) -> dict:
 
 def _ensure_role_profile(user_id: str, role: str, full_name: str, village: str | None = None) -> None:
     """Ensure a role-specific sub-profile exists for sender or transporter."""
+    uid_str = str(user_id)
     if role == "sender":
-        existing = db.one("select profile_id from sender_profiles where profile_id = ?", (user_id,))
+        existing = db.one("select profile_id from sender_profiles where profile_id = ?", (uid_str,))
         if not existing:
             db.insert(
                 "sender_profiles",
                 {
-                    "profile_id": user_id,
+                    "profile_id": uid_str,
                     "account_kind": "individual",
                     "village": village,
                     "created_at": NOW(),
                 },
             )
     elif role == "transporter":
-        existing = db.one("select profile_id from transporter_profiles where profile_id = ?", (user_id,))
+        existing = db.one("select profile_id from transporter_profiles where profile_id = ?", (uid_str,))
         if not existing:
             db.insert(
                 "transporter_profiles",
                 {
-                    "profile_id": user_id,
+                    "profile_id": uid_str,
                     "company_name": full_name,
                     "fleet_size": 0,
                     "verification_status": "pending",
@@ -145,7 +155,7 @@ def register(body: RegisterIn, request: Request):
     if db.one("select id from profiles where lower(email) = ?", (body.email.lower(),)):
         raise HTTPException(409, "An account with this email already exists")
 
-    pid = str(uid("USR"))
+    pid = _new_user_id()
     profile = {
         "id": pid,
         "email": body.email.lower(),
@@ -391,7 +401,7 @@ def google_sign_in(body: GoogleIn, request: Request):
     if not role:
         raise HTTPException(409, "new_account_needs_role")
 
-    pid = str(uid("USR"))
+    pid = _new_user_id()
     full_name = (body.full_name or claims.get("name") or email.split("@")[0]).strip()
     profile = {
         "id": pid,
