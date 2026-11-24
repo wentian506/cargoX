@@ -44,6 +44,7 @@ class ShipmentIn(BaseModel):
     quantity_kg: float = Field(gt=0)
     unit: str = "quintal"
     pickup_village: str
+    pickup_point: str | None = None
     pickup_state: str | None = None
     pickup_district: str | None = None
     pickup_lat: float
@@ -85,6 +86,13 @@ def _resolve_destination(body: ShipmentIn) -> tuple[str | None, str | None, floa
     return body.destination_id, body.destination_name, body.dest_lat, body.dest_lng
 
 
+def _format_pickup_point(body: ShipmentIn) -> str:
+    if body.pickup_point and body.pickup_point.strip():
+        return body.pickup_point.strip()
+    parts = [p.strip() for p in (body.pickup_village, body.pickup_district, body.pickup_state) if p and p.strip()]
+    return ", ".join(parts) if parts else "Pickup point"
+
+
 @router.post("/shipments")
 def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only)):
     did, dname, dlat, dlng = _resolve_destination(body)
@@ -103,49 +111,124 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
     status = "draft" if body.as_draft else "pending_admin_review"
     dest = (dlat, dlng) if dlat and dlng else None
     estimate = _estimate_freight(qty, (body.pickup_lat, body.pickup_lng), dest)
+    pickup_point_val = _format_pickup_point(body)
 
     db.insert("shipments", {
-        "id": sid, "code": code, "sender_id": principal["id"], "commodity": body.commodity.strip().lower(),
-        "quantity_kg": qty, "unit": body.unit, "pickup_village": body.pickup_village,
-        "pickup_district": body.pickup_district, "pickup_lat": body.pickup_lat, "pickup_lng": body.pickup_lng,
-        "pickup_state": body.pickup_state, "drop_state": body.drop_state, "drop_district": body.drop_district,
-        "destination_id": did, "destination_name": dname, "dest_lat": dlat, "dest_lng": dlng,
-        "ready_from": body.ready_from, "ready_to": body.ready_to, "deadline": body.deadline,
-        "packaging": body.packaging, "handling": body.handling, "temperature": body.temperature,
-        "special_instructions": body.special_instructions, "attachments": db.jdump(body.attachments),
+        "id": sid,
+        "code": code,
+        "sender_id": principal["id"],
+        "commodity": body.commodity.strip().lower(),
+        "quantity_kg": qty,
+        "unit": body.unit,
+        "pickup_village": body.pickup_village,
+        "pickup_point": pickup_point_val,
+        "pickup_district": body.pickup_district,
+        "pickup_lat": body.pickup_lat,
+        "pickup_lng": body.pickup_lng,
+        "pickup_state": body.pickup_state,
+        "drop_state": body.drop_state,
+        "drop_district": body.drop_district,
+        "destination_id": did,
+        "destination_name": dname,
+        "dest_lat": dlat,
+        "dest_lng": dlng,
+        "ready_from": body.ready_from,
+        "ready_to": body.ready_to,
+        "deadline": body.deadline,
+        "packaging": body.packaging,
+        "handling": body.handling,
+        "temperature": body.temperature,
+        "special_instructions": body.special_instructions,
+        "attachments": db.jdump(body.attachments),
         "requirements": (body.requirements or "").strip()[:600] or None,
-        "status": status, "freight_estimate": estimate, "freight_approved": False,
-        "direction": "outbound", "is_synthetic": True, "created_at": now, "updated_at": now,
+        "status": status,
+        "freight_estimate": estimate,
+        "freight_approved": False,
+        "direction": "outbound",
+        "is_synthetic": True,
+        "created_at": now,
+        "updated_at": now,
     })
+
     if not body.items:
-        db.insert("shipment_items", {"id": uid("ITM"), "shipment_id": sid, "commodity": body.commodity,
-                                     "quantity_kg": qty, "packaging": body.packaging, "handling": body.handling})
+        db.insert("shipment_items", {
+            "id": uid("ITM"),
+            "shipment_id": sid,
+            "commodity": body.commodity,
+            "quantity_kg": qty,
+            "packaging": body.packaging,
+            "handling": body.handling,
+        })
     for it in body.items:
         grams = it.quantity_kg * (1000 if it.unit == "tonne" else 100 if it.unit == "quintal" else 1)
         label = it.commodity.strip()
         if it.note:
             label = f"{label} — {it.note.strip()}"
-        db.insert("shipment_items", {"id": uid("ITM"), "shipment_id": sid, "commodity": label[:120],
-                                     "quantity_kg": grams,
-                                     "packaging": it.packaging or body.packaging,
-                                     "handling": it.handling or body.handling})
+        db.insert("shipment_items", {
+            "id": uid("ITM"),
+            "shipment_id": sid,
+            "commodity": label[:120],
+            "quantity_kg": grams,
+            "packaging": it.packaging or body.packaging,
+            "handling": it.handling or body.handling,
+        })
+
     if dname:
-        db.insert("shipment_destinations", {"id": uid("DST"), "shipment_id": sid, "name": dname,
-                                            "kind": "mandi", "lat": dlat, "lng": dlng,
-                                            "expected_price": None, "queue_minutes": 45, "preference_rank": 1})
+        try:
+            db.insert("shipment_destinations", {
+                "id": uid("DST"),
+                "shipment_id": sid,
+                "name": dname,
+                "kind": "mandi",
+                "lat": dlat,
+                "lng": dlng,
+                "expected_price": None,
+                "queue_minutes": 45,
+                "preference_rank": 1,
+            })
+        except Exception:
+            pass
+
     for i, opt in enumerate(body.destination_options[:4], start=2):
-        db.insert("shipment_destinations", {"id": uid("DST"), "shipment_id": sid, "name": opt.get("name", "Alternative"),
-                                            "kind": "mandi", "lat": opt.get("lat"), "lng": opt.get("lng"),
-                                            "expected_price": opt.get("expected_price"), "queue_minutes": 45,
-                                            "preference_rank": i})
-    event(sid, "shipment_created", actor_id=principal["id"],
-          payload={"status": status, "quantity_kg": qty, "commodity": body.commodity})
-    audit(principal, "shipment.create", entity_type="shipment", entity_id=sid, after={"status": status})
+        try:
+            db.insert("shipment_destinations", {
+                "id": uid("DST"),
+                "shipment_id": sid,
+                "name": opt.get("name", "Alternative"),
+                "kind": "mandi",
+                "lat": opt.get("lat"),
+                "lng": opt.get("lng"),
+                "expected_price": opt.get("expected_price"),
+                "queue_minutes": 45,
+                "preference_rank": i,
+            })
+        except Exception:
+            pass
+
+    try:
+        event(sid, "shipment_created", actor_id=principal["id"],
+              payload={"status": status, "quantity_kg": qty, "commodity": body.commodity})
+    except Exception:
+        pass
+
+    try:
+        audit(principal, "shipment.create", entity_type="shipment", entity_id=sid, after={"status": status})
+    except Exception:
+        pass
+
     if status == "pending_admin_review":
-        for admin in db.q("select id from profiles where role = 'admin' and status = 'active'"):
-            notify(admin["id"], f"New shipment {code} in review",
-                   f"{body.commodity} · {qty:,.0f} kg from {body.pickup_village}", "action",
-                   link="/admin/shipments")
+        try:
+            for admin in db.q("select id from profiles where role = 'admin'"):
+                notify(
+                    admin["id"],
+                    f"New shipment {code} in review",
+                    f"{body.commodity} · {qty:,.0f} kg from {pickup_point_val}",
+                    "action",
+                    link="/admin/shipments",
+                )
+        except Exception:
+            pass
+
     return {"shipment": shipment_view(get_shipment(sid)), "message": f"Shipment {code} created."}
 
 
@@ -185,7 +268,6 @@ def get_one(shipment_id: str, principal: Principal = Depends(any_role)):
     if principal["role"] == "sender" and row["sender_id"] != principal["id"]:
         raise HTTPException(403, "You can only access your own shipments")
     view = shipment_view(row, include_events=True)
-    # transporter assignment context — the sender sees it too, read-only
     assignment = db.one(
         """select ta.*, v.reg_no, v.vehicle_class, v.payload_kg from transport_assignments ta
            left join vehicles v on v.id = ta.vehicle_id
@@ -196,7 +278,6 @@ def get_one(shipment_id: str, principal: Principal = Depends(any_role)):
         (row["id"], principal["id"]),
     )
     view["assignment"] = assignment
-    # the pickup arrival clock: idle before acceptance, counting down afterwards
     view["arrival"] = arrival.clock_for(assignment["id"]) if assignment else None
     return view
 
@@ -212,15 +293,20 @@ def update_shipment(shipment_id: str, body: ShipmentIn, principal: Principal = D
         raise HTTPException(409, f"Shipment can no longer be edited in status '{row['status']}'")
     before = shipment_view(row)
     qty = body.quantity_kg * (100 if body.unit == "quintal" else 1000 if body.unit == "tonne" else 1)
+    pickup_point_val = _format_pickup_point(body)
     db.execute(
-        """update shipments set commodity = ?, quantity_kg = ?, pickup_village = ?, pickup_lat = ?,
-           pickup_lng = ?, destination_name = ?, dest_lat = ?, dest_lng = ?, ready_from = ?,
-           ready_to = ?, deadline = ?, packaging = ?, handling = ?, temperature = ?,
+        """update shipments set commodity = ?, quantity_kg = ?, pickup_village = ?, pickup_point = ?,
+           pickup_lat = ?, pickup_lng = ?, destination_name = ?, dest_lat = ?, dest_lng = ?,
+           ready_from = ?, ready_to = ?, deadline = ?, packaging = ?, handling = ?, temperature = ?,
            special_instructions = ?, status = ?, updated_at = ? where id = ?""",
-        (body.commodity, qty, body.pickup_village, body.pickup_lat, body.pickup_lng, body.destination_name,
-         body.dest_lat, body.dest_lng, body.ready_from, body.ready_to, body.deadline, body.packaging,
-         body.handling, body.temperature, body.special_instructions,
-         "pending_admin_review" if row["status"] == "draft" else row["status"], NOW(), shipment_id),
+        (
+            body.commodity, qty, body.pickup_village, pickup_point_val, body.pickup_lat,
+            body.pickup_lng, body.destination_name, body.dest_lat, body.dest_lng, body.ready_from,
+            body.ready_to, body.deadline, body.packaging, body.handling, body.temperature,
+            body.special_instructions,
+            "pending_admin_review" if row["status"] == "draft" else row["status"],
+            NOW(), shipment_id,
+        ),
     )
     event(shipment_id, "shipment_updated", actor_id=principal["id"], payload={"fields": "core"})
     audit(principal, "shipment.update", entity_type="shipment", entity_id=shipment_id, before=before)
