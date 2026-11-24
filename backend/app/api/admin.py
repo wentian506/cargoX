@@ -30,22 +30,22 @@ def _is_postgres() -> bool:
     return (db.dialect() or "").lower() in ("postgres", "postgresql")
 
 
-def _verified_true_sql() -> str:
-    return "verified is true" if _is_postgres() else "verified = 1"
+def _verified_true_sql(alias: str = "") -> str:
+    col = f"{alias}.verified" if alias else "verified"
+    return f"{col} is true" if _is_postgres() else f"{col} = 1"
 
 
-def _verified_false_sql() -> str:
-    return "coalesce(verified, false) is false" if _is_postgres() else "coalesce(verified, 0) = 0"
+def _verified_false_sql(alias: str = "") -> str:
+    col = f"{alias}.verified" if alias else "verified"
+    return f"coalesce({col}, false) is false" if _is_postgres() else f"coalesce({col}, 0) = 0"
+
+
+def _str_id(val: object) -> str:
+    return "" if val is None else str(val)
 
 
 # --------------------------------------------------------------------------- #
 # admin-aliased intelligence readers
-#
-# The admin namespace mirrors the read-only intelligence endpoints so the whole
-# control tower can be served under one role-guarded prefix. They are thin
-# aliases over the same functions and are hand-written on purpose: an admin-role
-# dependency plus a handler that personally calls Depends(admin_only) would
-# otherwise be evaluated twice, and a router-level guard already covers them.
 # --------------------------------------------------------------------------- #
 @router.get("/agrocompat/matrix")
 def admin_agrocompat_matrix(commodities: str | None = Query("wheat,paddy,potato,onion,tomato")):
@@ -56,8 +56,6 @@ def admin_agrocompat_matrix(commodities: str | None = Query("wheat,paddy,potato,
 
 @router.get("/capacity/match/view")
 def admin_capacity_match_view():
-    # explicit payload=None: match_capacity's default would be parsed as a
-    # request-body model on a GET and fail with a 422
     return match_capacity(payload=None, pool_id=None)
 
 
@@ -66,29 +64,38 @@ def admin_capacity_match_view():
 # --------------------------------------------------------------------------- #
 @router.get("/overview")
 def overview():
-    def c(sql, params=()):
-        return db.scalar(sql, params, 0) or 0
+    def c(sql: str, params: tuple | list = ()) -> int:
+        return int(db.scalar(sql, params, 0) or 0)
 
     senders = c("select count(*) from profiles where role='sender'")
     transporters = c("select count(*) from profiles where role='transporter'")
     total_shipments = c("select count(*) from shipments")
     pending = c("select count(*) from shipments where status='pending_admin_review'")
-    active = c(f"select count(*) from shipments where status in ({','.join('?'*len(ACTIVE_STATUSES))})", ACTIVE_STATUSES)
+    active = c(
+        f"select count(*) from shipments where status in ({','.join('?' * len(ACTIVE_STATUSES))})",
+        ACTIVE_STATUSES,
+    )
     delivered = c("select count(*) from shipments where status='delivered'")
     vehicles_total = c("select count(*) from vehicles")
     vehicles_available = c("select count(*) from vehicles where availability='available'")
     vehicles_verified = c(f"select count(*) from vehicles where {_verified_true_sql()}")
     assigned = c("select count(*) from transport_assignments where status in ('confirmed','sender_approved')")
     delayed = c("select count(*) from trips where delay_reported is not null and status <> 'delivered'")
-    volume = db.scalar("select coalesce(sum(quantity_kg),0) from shipments where status <> 'cancelled'", default=0)
-    savings = db.scalar("select coalesce(sum(saving),0) from cost_allocations where approval = 'approved'", default=0)
-    committed_capacity = db.scalar(
-        "select coalesce(sum(payload_kg),0) from capacity_blocks where status in ('published','reserved')",
-        default=0,
+    volume = float(db.scalar("select coalesce(sum(quantity_kg),0) from shipments where status <> 'cancelled'", default=0) or 0)
+    savings = float(db.scalar("select coalesce(sum(saving),0) from cost_allocations where approval = 'approved'", default=0) or 0)
+    committed_capacity = float(
+        db.scalar(
+            "select coalesce(sum(payload_kg),0) from capacity_blocks where status in ('published','reserved')",
+            default=0,
+        )
+        or 0
     )
-    pool_demand = db.scalar(
-        "select coalesce(sum(quantity_kg),0) from shipments where status in ('pending_admin_review','planning','matched')",
-        default=0,
+    pool_demand = float(
+        db.scalar(
+            "select coalesce(sum(quantity_kg),0) from shipments where status in ('pending_admin_review','planning','matched')",
+            default=0,
+        )
+        or 0
     )
 
     recent = db.q("select * from shipments order by created_at desc limit 6")
@@ -107,10 +114,10 @@ def overview():
             "delayed_shipments": delayed,
         },
         "volume_kg": volume,
-        "freight_savings": round(float(savings), 2),
-        "capacity_coverage_ratio": round(float(committed_capacity) / float(pool_demand), 2) if pool_demand else 0.0,
+        "freight_savings": round(savings, 2),
+        "capacity_coverage_ratio": round(committed_capacity / pool_demand, 2) if pool_demand else 0.0,
         "committed_capacity_kg": committed_capacity,
-        "uncovered_demand_kg": max(0, float(pool_demand) - float(committed_capacity)),
+        "uncovered_demand_kg": max(0.0, pool_demand - committed_capacity),
         "recent_shipments": [shipment_view(r) for r in recent],
         "alerts": _alerts(),
         "synthetic": True,
@@ -124,7 +131,7 @@ def _alerts() -> list[dict]:
         out.append({
             "kind": "action",
             "title": f"{len(pending)} shipment(s) awaiting review",
-            "body": ", ".join(p["code"] for p in pending[:4]),
+            "body": ", ".join(str(p.get("code") or "") for p in pending[:4]),
             "link": "/admin/shipments",
         })
     unverified = db.q(f"select id, reg_no from vehicles where {_verified_false_sql()}")
@@ -135,7 +142,7 @@ def _alerts() -> list[dict]:
             "body": "Assignments are blocked until documents are verified.",
             "link": "/admin/vehicles",
         })
-    low = db.q("""select s.code from shipments s where s.status='awaiting_sender_approval'""")
+    low = db.q("select s.code from shipments s where s.status='awaiting_sender_approval'")
     if low:
         out.append({
             "kind": "info",
@@ -177,7 +184,8 @@ class StatusIn(BaseModel):
 
 @router.post("/users/{profile_id}/status")
 def set_user_status(profile_id: str, body: StatusIn, principal: Principal = Depends(admin_only)):
-    row = db.one("select * from profiles where id = ?", (profile_id,))
+    pid = _str_id(profile_id)
+    row = db.one("select * from profiles where id = ?", (pid,))
     if not row:
         raise HTTPException(404, "Account not found")
     if row["role"] == "admin":
@@ -185,20 +193,34 @@ def set_user_status(profile_id: str, body: StatusIn, principal: Principal = Depe
     new_status = {"suspend": "suspended", "reactivate": "active", "verify": "active"}[body.action]
     db.execute(
         "update profiles set status = ?, verified_at = ? where id = ?",
-        (new_status, NOW() if body.action == "verify" else row["verified_at"], profile_id),
+        (new_status, NOW() if body.action == "verify" else row.get("verified_at"), pid),
     )
     if row["role"] == "transporter" and body.action == "verify":
-        db.execute("update transporter_profiles set verification_status = 'verified' where profile_id = ?", (profile_id,))
+        existing_tp = db.one("select profile_id from transporter_profiles where profile_id = ?", (pid,))
+        if existing_tp:
+            db.execute("update transporter_profiles set verification_status = 'verified' where profile_id = ?", (pid,))
+        else:
+            db.insert(
+                "transporter_profiles",
+                {
+                    "profile_id": pid,
+                    "company_name": _str_id(row.get("full_name") or "Transporter"),
+                    "fleet_size": 0,
+                    "verification_status": "verified",
+                    "rating": 0,
+                    "created_at": NOW(),
+                },
+            )
     audit(
         principal,
         f"user.{body.action}",
         entity_type="profile",
-        entity_id=profile_id,
+        entity_id=pid,
         before={"status": row["status"]},
         after={"status": new_status, "reason": body.reason},
     )
     notify(
-        profile_id,
+        pid,
         f"Account {body.action}d by Admin",
         body.reason or "",
         "warning" if body.action == "suspend" else "success",
@@ -218,7 +240,7 @@ def admin_shipments(
     page_size: int = 50,
 ):
     sql = """select s.*, p.full_name as sender_name from shipments s
-             join profiles p on p.id = s.sender_id where 1=1"""
+             left join profiles p on p.id = s.sender_id where 1=1"""
     params: list = []
     if status and status != "all":
         sql += " and s.status = ?"
@@ -227,14 +249,14 @@ def admin_shipments(
         sql += " and s.commodity = ?"
         params.append(commodity)
     if q:
-        sql += " and (lower(s.code) like ? or lower(p.full_name) like ? or lower(s.pickup_village) like ?)"
+        sql += " and (lower(s.code) like ? or lower(coalesce(p.full_name,'')) like ? or lower(coalesce(s.pickup_village,'')) like ?)"
         params += [f"%{q.lower()}%"] * 3
     sql += " order by s.created_at desc"
     rows = db.q(sql, params)
     items = []
     for r in rows:
         v = shipment_view(r)
-        v["sender_name"] = r["sender_name"]
+        v["sender_name"] = r.get("sender_name")
         items.append(v)
     return paginate(items, page, page_size)
 
@@ -247,7 +269,8 @@ class ReviewIn(BaseModel):
 
 @router.post("/shipments/{shipment_id}/review")
 def review_shipment(shipment_id: str, body: ReviewIn, principal: Principal = Depends(admin_only)):
-    row = get_shipment(shipment_id)
+    sid = _str_id(shipment_id)
+    row = get_shipment(sid)
     if not row:
         raise HTTPException(404, "Shipment not found")
     if row["status"] not in ("pending_admin_review", "draft"):
@@ -273,13 +296,13 @@ def review_shipment(shipment_id: str, body: ReviewIn, principal: Principal = Dep
                 sets = ", ".join(f"{k} = ?" for k in allowed)
                 db.execute(
                     f"update shipments set {sets}, updated_at = ? where id = ?",
-                    list(allowed.values()) + [NOW(), shipment_id],
+                    list(allowed.values()) + [NOW(), sid],
                 )
                 audit(
                     principal,
                     "shipment.admin_edit",
                     entity_type="shipment",
-                    entity_id=shipment_id,
+                    entity_id=sid,
                     before=shipment_view(row),
                     after=allowed,
                 )
@@ -289,16 +312,16 @@ def review_shipment(shipment_id: str, body: ReviewIn, principal: Principal = Dep
         set_status(row, "cancelled", actor=principal, note=body.note or "Rejected by Admin.")
         message = "Shipment rejected."
     else:
-        event(shipment_id, "info_requested", actor_id=principal["id"], payload={"note": body.note})
+        event(sid, "info_requested", actor_id=_str_id(principal["id"]), payload={"note": body.note})
         notify(
-            row["sender_id"],
+            _str_id(row["sender_id"]),
             f"More information needed for {row['code']}",
             body.note or "",
             "action",
             "/sender/shipments",
         )
         message = "Information requested from sender."
-    return {"message": message, "shipment": shipment_view(get_shipment(shipment_id))}
+    return {"message": message, "shipment": shipment_view(get_shipment(sid))}
 
 
 # --------------------------------------------------------------------------- #
@@ -306,18 +329,19 @@ def review_shipment(shipment_id: str, body: ReviewIn, principal: Principal = Dep
 # --------------------------------------------------------------------------- #
 @router.post("/pools/auto")
 def auto_pool(principal: Principal = Depends(admin_only)):
-    """Group planning-ready shipments by destination corridor + compatibility."""
     rows = db.q("select * from shipments where status in ('planning','pending_admin_review') and pool_id is null")
     created = []
     consumed: set[str] = set()
     for a in rows:
-        if a["id"] in consumed:
+        aid = _str_id(a["id"])
+        if aid in consumed:
             continue
         group = [a]
         for b in rows:
-            if b["id"] in consumed or b["id"] == a["id"]:
+            bid = _str_id(b["id"])
+            if bid in consumed or bid == aid:
                 continue
-            if b["destination_id"] and b["destination_id"] == a["destination_id"]:
+            if b.get("destination_id") and b.get("destination_id") == a.get("destination_id"):
                 if compat.check_set([g["commodity"] for g in group] + [b["commodity"]])["compatible"]:
                     if road_km(a["pickup_lat"], a["pickup_lng"], b["pickup_lat"], b["pickup_lng"]) <= 18:
                         group.append(b)
@@ -325,29 +349,30 @@ def auto_pool(principal: Principal = Depends(admin_only)):
             continue
         pid = uid("POOL")
         compat_res = compat.check_set([g["commodity"] for g in group])
-        corridor = f"{a['pickup_district'] or 'rural'}->{a['destination_name'] or 'mandi'}"
+        corridor = f"{a.get('pickup_district') or 'rural'}->{a.get('destination_name') or 'mandi'}"
         db.insert("shipment_pools", {
             "id": pid,
             "corridor": corridor,
             "status": "proposed",
-            "total_kg": sum(g["quantity_kg"] for g in group),
+            "total_kg": sum(float(g["quantity_kg"] or 0) for g in group),
             "compatible": 1 if compat_res["compatible"] else 0,
             "notes": "; ".join(compat_res["warnings"])[:400] or None,
             "created_at": NOW(),
         })
         for g in group:
-            db.execute("update shipments set pool_id = ?, updated_at = ? where id = ?", (pid, NOW(), g["id"]))
-            consumed.add(g["id"])
-            event(g["id"], "pooled", actor_id=principal["id"], payload={"pool_id": pid})
+            gid = _str_id(g["id"])
+            db.execute("update shipments set pool_id = ?, updated_at = ? where id = ?", (pid, NOW(), gid))
+            consumed.add(gid)
+            event(gid, "pooled", actor_id=_str_id(principal["id"]), payload={"pool_id": pid})
         created.append({
             "pool_id": pid,
             "corridor": corridor,
             "members": [g["code"] for g in group],
-            "total_kg": sum(g["quantity_kg"] for g in group),
+            "total_kg": sum(float(g["quantity_kg"] or 0) for g in group),
             "compatibility": compat_res,
         })
         audit(principal, "pool.create", entity_type="shipment_pool", entity_id=pid,
-              after={"members": [g["id"] for g in group]})
+              after={"members": [_str_id(g["id"]) for g in group]})
     return {
         "created": created,
         "count": len(created),
@@ -361,10 +386,11 @@ def auto_pool(principal: Principal = Depends(admin_only)):
 def list_pools():
     pools = db.q("select * from shipment_pools order by created_at desc")
     for p in pools:
-        members = db.q("select * from shipments where pool_id = ?", (p["id"],))
+        pid = _str_id(p["id"])
+        members = db.q("select * from shipments where pool_id = ?", (pid,))
         p["members"] = [shipment_view(m) for m in members]
         p["compatibility"] = compat.check_set([m["commodity"] for m in members]) if members else None
-        p["total_kg"] = sum(float(m["quantity_kg"]) for m in members)
+        p["total_kg"] = sum(float(m["quantity_kg"] or 0) for m in members)
         p["vehicle_class_suggestion"] = _suggest_class(p["total_kg"])
     return {"items": pools}
 
@@ -384,21 +410,22 @@ class PoolActionIn(BaseModel):
 
 @router.post("/pools/{pool_id}/action")
 def pool_action(pool_id: str, body: PoolActionIn, principal: Principal = Depends(admin_only)):
-    pool = db.one("select * from shipment_pools where id = ?", (pool_id,))
+    pid = _str_id(pool_id)
+    pool = db.one("select * from shipment_pools where id = ?", (pid,))
     if not pool:
         raise HTTPException(404, "Pool not found")
     if body.action == "approve":
         compat_res = compat.check_set([
-            s["commodity"] for s in db.q("select * from shipments where pool_id = ?", (pool_id,))
+            s["commodity"] for s in db.q("select * from shipments where pool_id = ?", (pid,))
         ])
         if not compat_res["compatible"]:
             raise HTTPException(409, f"AgroCompat blocks this pool: {compat_res['blockers'][0]['hard']}")
-        db.execute("update shipment_pools set status = 'approved' where id = ?", (pool_id,))
-        for s in db.q("select * from shipments where pool_id = ?", (pool_id,)):
+        db.execute("update shipment_pools set status = 'approved' where id = ?", (pid,))
+        for s in db.q("select * from shipments where pool_id = ?", (pid,)):
             set_status(s, "matched", actor=principal, note="Pool approved.")
     elif body.action == "split":
-        ids = body.shipment_ids or []
-        if len(ids) < 1:
+        ids = [_str_id(x) for x in (body.shipment_ids or []) if x]
+        if not ids:
             raise HTTPException(400, "shipment_ids required to split a pool")
         nid = uid("POOL")
         db.insert("shipment_pools", {
@@ -412,13 +439,13 @@ def pool_action(pool_id: str, body: PoolActionIn, principal: Principal = Depends
         })
         for sid in ids:
             db.execute("update shipments set pool_id = ? where id = ?", (nid, sid))
-        for p in (pool_id, nid):
-            tot = db.scalar("select coalesce(sum(quantity_kg),0) from shipments where pool_id = ?", (p,), 0)
+        for p in (pid, nid):
+            tot = float(db.scalar("select coalesce(sum(quantity_kg),0) from shipments where pool_id = ?", (p,), 0) or 0)
             db.execute("update shipment_pools set total_kg = ? where id = ?", (tot, p))
     else:
-        db.execute("update shipment_pools set status = 'rejected' where id = ?", (pool_id,))
-        db.execute("update shipments set pool_id = null where pool_id = ?", (pool_id,))
-    audit(principal, f"pool.{body.action}", entity_type="shipment_pool", entity_id=pool_id)
+        db.execute("update shipment_pools set status = 'rejected' where id = ?", (pid,))
+        db.execute("update shipments set pool_id = null where pool_id = ?", (pid,))
+    audit(principal, f"pool.{body.action}", entity_type="shipment_pool", entity_id=pid)
     return {"ok": True, "action": body.action}
 
 
@@ -428,8 +455,6 @@ def pool_action(pool_id: str, body: PoolActionIn, principal: Principal = Depends
 @router.post("/capacity/match")
 @router.get("/capacity/match")
 def match_capacity(payload: dict | None = None, pool_id: str | None = None):
-    # GET is supported so the screen can render the standing match table without
-    # needing a write; POST re-runs the match for a specific pool.
     payload = payload or ({"pool_id": pool_id} if pool_id else None)
     pool_id = (payload or {}).get("pool_id")
     sql = """select cb.*, v.reg_no, p.full_name as transporter_name, tp.verification_status
@@ -438,27 +463,30 @@ def match_capacity(payload: dict | None = None, pool_id: str | None = None):
              left join transporter_profiles tp on tp.profile_id = cb.transporter_id
              where cb.status = 'published'"""
     blocks = db.q(sql)
-    demand_kg = 0.0
     if pool_id:
-        demand_kg = float(db.scalar("select coalesce(sum(quantity_kg),0) from shipments where pool_id = ?", (pool_id,), 0))
+        demand_kg = float(db.scalar("select coalesce(sum(quantity_kg),0) from shipments where pool_id = ?", (_str_id(pool_id),), 0) or 0)
     else:
-        demand_kg = float(db.scalar(
-            "select coalesce(sum(quantity_kg),0) from shipments where status in ('planning','matched','pending_admin_review')",
-            default=0,
-        ))
+        demand_kg = float(
+            db.scalar(
+                "select coalesce(sum(quantity_kg),0) from shipments where status in ('planning','matched','pending_admin_review')",
+                default=0,
+            )
+            or 0
+        )
     scored = []
     for b in blocks:
-        fit = min(1.0, float(b["payload_kg"]) / demand_kg) if demand_kg else 0.0
-        verified = (b["verification_status"] or "") == "verified"
+        b_kg = float(b.get("payload_kg") or 0)
+        fit = min(1.0, b_kg / demand_kg) if demand_kg else 0.0
+        verified = (b.get("verification_status") or "") == "verified"
         scored.append({
             **b,
             "fit_ratio": round(fit, 3),
-            "sufficient": float(b["payload_kg"]) >= demand_kg,
+            "sufficient": b_kg >= demand_kg,
             "transporter_verified": verified,
             "rank_score": round(fit * (1.2 if verified else 0.9), 3),
         })
-    scored.sort(key=lambda x: (-x["rank_score"], x["reserve_price_per_km"] or 0))
-    committed = sum(float(b["payload_kg"]) for b in blocks)
+    scored.sort(key=lambda x: (-x["rank_score"], float(x.get("reserve_price_per_km") or 0)))
+    committed = sum(float(b.get("payload_kg") or 0) for b in blocks)
     return {
         "demand_kg": round(demand_kg, 1),
         "committed_capacity_kg": round(committed, 1),
@@ -477,19 +505,19 @@ def match_capacity(payload: dict | None = None, pool_id: str | None = None):
 @router.post("/plans/generate")
 def generate_plan(payload: dict):
     pool_id = payload.get("pool_id")
-    members = db.q("select * from shipments where pool_id = ?", (pool_id,)) if pool_id else \
+    members = db.q("select * from shipments where pool_id = ?", (_str_id(pool_id),)) if pool_id else \
         db.q("select * from shipments where status in ('planning','matched')")
     if not members:
         raise HTTPException(409, "No shipments to plan")
-    dest_row = next((m for m in members if m["dest_lat"]), None)
+    dest_row = next((m for m in members if m.get("dest_lat")), None)
     destination = {
-        "name": (dest_row or members[0])["destination_name"] or "Mandi",
-        "lat": (dest_row or members[0])["dest_lat"] or 30.704,
-        "lng": (dest_row or members[0])["dest_lng"] or 76.223,
+        "name": (dest_row or members[0]).get("destination_name") or "Mandi",
+        "lat": (dest_row or members[0]).get("dest_lat") or 30.704,
+        "lng": (dest_row or members[0]).get("dest_lng") or 76.223,
     }
     depot = destination
     stops = [{
-        "id": m["id"],
+        "id": _str_id(m["id"]),
         "name": m["pickup_village"],
         "lat": m["pickup_lat"],
         "lng": m["pickup_lng"],
@@ -500,13 +528,13 @@ def generate_plan(payload: dict):
 
     vehicles = db.q(f"""select v.*, cb.payload_kg as block_kg, cb.reserve_price_per_km
                         from vehicles v left join capacity_blocks cb on cb.vehicle_id = v.id and cb.status='published'
-                        where v.{_verified_true_sql()}""")
+                        where {_verified_true_sql('v')}""")
     veh_payload = [
         {
-            "id": v["id"],
+            "id": _str_id(v["id"]),
             "class": v["vehicle_class"],
-            "capacity_kg": v["block_kg"] or v["payload_kg"],
-            "cost_per_km": v["reserve_price_per_km"] or v["cost_per_km"],
+            "capacity_kg": v.get("block_kg") or v["payload_kg"],
+            "cost_per_km": v.get("reserve_price_per_km") or v["cost_per_km"],
         }
         for v in vehicles
     ] or [{"id": "IMPLIED-LCV", "class": "lcv", "capacity_kg": 7500, "cost_per_km": 30}]
@@ -538,7 +566,7 @@ def generate_plan(payload: dict):
         destination=destination,
     )
     compat_res = compat.check_set([m["commodity"] for m in members])
-    total_kg = sum(float(m["quantity_kg"]) for m in members)
+    total_kg = sum(float(m["quantity_kg"] or 0) for m in members)
 
     plan = {
         "pool_id": pool_id,
@@ -555,7 +583,7 @@ def generate_plan(payload: dict):
         {"id": "system", "role": "admin"},
         "plan.generate",
         entity_type="shipment_pool",
-        entity_id=pool_id or "adhoc",
+        entity_id=_str_id(pool_id) or "adhoc",
         after={"total_kg": total_kg},
     )
     return plan
@@ -576,24 +604,23 @@ class DispatchIn(BaseModel):
 @router.post("/dispatch/decide")
 def decide_dispatch(body: DispatchIn, principal: Principal = Depends(admin_only)):
     if body.pool_id:
-        members = db.q("select * from shipments where pool_id = ?", (body.pool_id,))
+        members = db.q("select * from shipments where pool_id = ?", (_str_id(body.pool_id),))
     else:
         members = db.q("select * from shipments where status in ('planning','matched')")
     if not members:
         raise HTTPException(409, "No shipments in scope")
-    pool_kg = sum(float(m["quantity_kg"]) for m in members)
+    pool_kg = sum(float(m["quantity_kg"] or 0) for m in members)
     commodity = members[0]["commodity"]
     price = db.one(
         "select price_mode from market_observations where commodity_id = ? order by obs_date desc limit 1",
         (commodity,),
     )
-    value_per_kg = (float(price["price_mode"]) / 100) if price else 22.0
-    capacity = body.capacity_kg or float(db.scalar(
-        "select coalesce(sum(payload_kg),0) from capacity_blocks where status='published'",
-        default=0,
-    )) or pool_kg
+    value_per_kg = (float(price["price_mode"]) / 100) if price and price.get("price_mode") is not None else 22.0
+    capacity = body.capacity_kg or float(
+        db.scalar("select coalesce(sum(payload_kg),0) from capacity_blocks where status='published'", default=0) or 0
+    ) or pool_kg
 
-    ready = {m["id"]: (m["status"] != "planning") for m in members}
+    ready = {_str_id(m["id"]): (m["status"] != "planning") for m in members}
     ready_ratio = body.ready_ratio if body.ready_ratio is not None else sum(ready.values()) / max(len(members), 1)
 
     result = dispatch.decide(
@@ -609,7 +636,7 @@ def decide_dispatch(body: DispatchIn, principal: Principal = Depends(admin_only)
     did = uid("DD")
     db.insert("dispatch_decisions", {
         "id": did,
-        "pool_id": body.pool_id,
+        "pool_id": _str_id(body.pool_id) or None,
         "decision": result["decision"],
         "expected_wait_benefit": result["wait_benefit"],
         "delay_cost": result["delay_cost"],
@@ -621,9 +648,9 @@ def decide_dispatch(body: DispatchIn, principal: Principal = Depends(admin_only)
     })
     for m in members:
         event(
-            m["id"],
+            _str_id(m["id"]),
             "dispatch_recommendation",
-            actor_id=principal["id"],
+            actor_id=_str_id(principal["id"]),
             payload={"decision": result["decision"], "pool_id": body.pool_id},
         )
     return {"decision_id": did, "pool_kg": pool_kg, "capacity_kg": capacity, **result}
@@ -631,19 +658,21 @@ def decide_dispatch(body: DispatchIn, principal: Principal = Depends(admin_only)
 
 @router.post("/dispatch/{decision_id}/approve")
 def approve_dispatch(decision_id: str, principal: Principal = Depends(admin_only)):
-    d = db.one("select * from dispatch_decisions where id = ?", (decision_id,))
+    did = _str_id(decision_id)
+    d = db.one("select * from dispatch_decisions where id = ?", (did,))
     if not d:
         raise HTTPException(404, "Decision not found")
-    db.execute("update dispatch_decisions set approved_by = ? where id = ?", (principal["id"], decision_id))
-    if d["decision"] == "GO" and d["pool_id"]:
-        db.execute("update shipment_pools set status = 'dispatched' where id = ?", (d["pool_id"],))
-        for s in db.q("select * from shipments where pool_id = ?", (d["pool_id"],)):
+    db.execute("update dispatch_decisions set approved_by = ? where id = ?", (_str_id(principal["id"]), did))
+    if d["decision"] == "GO" and d.get("pool_id"):
+        pid = _str_id(d["pool_id"])
+        db.execute("update shipment_pools set status = 'dispatched' where id = ?", (pid,))
+        for s in db.q("select * from shipments where pool_id = ?", (pid,)):
             set_status(s, "confirmed", actor=principal, note="DispatchSense GO approved by Admin.")
     audit(
         principal,
         "dispatch.approve",
         entity_type="dispatch_decision",
-        entity_id=decision_id,
+        entity_id=did,
         after={"decision": d["decision"]},
     )
     return {"approved": True, "decision": d["decision"]}
@@ -655,36 +684,38 @@ def approve_dispatch(decision_id: str, principal: Principal = Depends(admin_only
 @router.post("/allocations/compute")
 def compute_allocations(payload: dict, principal: Principal = Depends(admin_only)):
     pool_id = payload.get("pool_id")
-    members = db.q("select * from shipments where pool_id = ?", (pool_id,)) if pool_id else \
+    pid = _str_id(pool_id)
+    members = db.q("select * from shipments where pool_id = ?", (pid,)) if pid else \
         db.q("select * from shipments where status in ('planning','matched')")
     if len(members) < 2:
         raise HTTPException(409, "At least two consignments are needed for a coalition")
 
-    dest_row = next((m for m in members if m["dest_lat"]), members[0])
-    depot = (dest_row["dest_lat"] or 30.704, dest_row["dest_lng"] or 76.223)
-    vehicle_class = payload.get("vehicle_class") or _suggest_class(sum(float(m["quantity_kg"]) for m in members))
-    cost_km = float(payload.get("cost_per_km") or db.scalar(
-        "select coalesce(avg(reserve_price_per_km), 28) from capacity_blocks where status='published'",
-        default=28,
-    ))
+    dest_row = next((m for m in members if m.get("dest_lat")), members[0])
+    depot = (dest_row.get("dest_lat") or 30.704, dest_row.get("dest_lng") or 76.223)
+    vehicle_class = payload.get("vehicle_class") or _suggest_class(sum(float(m["quantity_kg"] or 0) for m in members))
+    cost_km = float(
+        payload.get("cost_per_km")
+        or db.scalar("select coalesce(avg(reserve_price_per_km), 28) from capacity_blocks where status='published'", default=28)
+        or 28
+    )
     fixed = float(payload.get("fixed_cost") or 350)
 
     result = shapley.allocate(
-        members=[{"shipment_id": m["id"], "lat": m["pickup_lat"], "lng": m["pickup_lng"]} for m in members],
+        members=[{"shipment_id": _str_id(m["id"]), "lat": m["pickup_lat"], "lng": m["pickup_lng"]} for m in members],
         depot=depot,
         cost_km=cost_km,
         fixed=fixed,
         floor_at_solo=True,
     )
     cid = uid("COAL")
-    if pool_id:
+    if pid:
         db.execute(
             "delete from cost_allocations where coalition_id in (select id from coalitions where pool_id = ?)",
-            (pool_id,),
+            (pid,),
         )
     db.insert("coalitions", {
         "id": cid,
-        "pool_id": pool_id,
+        "pool_id": pid or None,
         "coalition_cost": result["coalition_cost"],
         "solo_cost_total": result["solo_total"],
         "method": result["method"],
@@ -692,10 +723,11 @@ def compute_allocations(payload: dict, principal: Principal = Depends(admin_only
         "created_at": NOW(),
     })
     for row in result["rows"]:
+        sid = _str_id(row["shipment_id"])
         db.insert("cost_allocations", {
             "id": uid("ALLOC"),
             "coalition_id": cid,
-            "shipment_id": row["shipment_id"],
+            "shipment_id": sid,
             "standalone_cost": row["standalone_cost"],
             "allocated_share": row["allocated_share"],
             "detour_km": row["detour_contribution_km"],
@@ -707,28 +739,29 @@ def compute_allocations(payload: dict, principal: Principal = Depends(admin_only
         })
         db.execute(
             "update shipments set coalition_id = ?, status = ?, updated_at = ? where id = ?",
-            (cid, "awaiting_sender_approval", NOW(), row["shipment_id"]),
+            (cid, "awaiting_sender_approval", NOW(), sid),
         )
-        shp = get_shipment(row["shipment_id"])
+        shp = get_shipment(sid)
         event(
-            row["shipment_id"],
+            sid,
             "allocation_proposed",
-            actor_id=principal["id"],
+            actor_id=_str_id(principal["id"]),
             payload={"allocated_share": row["allocated_share"], "saving": row["saving"]},
         )
-        notify(
-            shp["sender_id"],
-            f"Fair-share proposal for {shp['code']}",
-            f"Your allocated share is ₹{row['allocated_share']:,.0f} (saving ₹{row['saving']:,.0f}). Please approve.",
-            "action",
-            f"/sender/shipments/{shp['id']}",
-        )
+        if shp:
+            notify(
+                _str_id(shp["sender_id"]),
+                f"Fair-share proposal for {shp['code']}",
+                f"Your allocated share is ₹{row['allocated_share']:,.0f} (saving ₹{row['saving']:,.0f}). Please approve.",
+                "action",
+                f"/sender/shipments/{_str_id(shp['id'])}",
+            )
     audit(
         principal,
         "allocation.compute",
         entity_type="coalition",
         entity_id=cid,
-        after={"method": result["method"], "members": [m["id"] for m in members]},
+        after={"method": result["method"], "members": [_str_id(m["id"]) for m in members]},
     )
     return {
         "coalition_id": cid,
@@ -741,9 +774,6 @@ def compute_allocations(payload: dict, principal: Principal = Depends(admin_only
 
 @router.get("/allocations")
 def list_allocations():
-    # One row per shipment per coalition. Earlier coalitions for the same pool are
-    # superseded when a pool is re-computed, so only the latest coalition per pool
-    # is returned — otherwise savings are double counted in the totals.
     rows = db.q("""select ca.*, s.code, s.commodity, s.quantity_kg, s.status as shipment_status,
                           c.method, c.coalition_cost, c.solo_cost_total, c.pool_id
                    from cost_allocations ca
@@ -758,11 +788,11 @@ def list_allocations():
     return {
         "items": rows,
         "summary": {
-            "total_allocated": round(sum(float(r["allocated_share"]) for r in rows), 2),
-            "total_saving": round(sum(float(r["saving"]) for r in rows), 2),
-            "pending": sum(1 for r in rows if r["approval"] == "pending"),
-            "approved": sum(1 for r in rows if r["approval"] == "approved"),
-            "rejected": sum(1 for r in rows if r["approval"] == "rejected"),
+            "total_allocated": round(sum(float(r.get("allocated_share") or 0) for r in rows), 2),
+            "total_saving": round(sum(float(r.get("saving") or 0) for r in rows), 2),
+            "pending": sum(1 for r in rows if r.get("approval") == "pending"),
+            "approved": sum(1 for r in rows if r.get("approval") == "approved"),
+            "rejected": sum(1 for r in rows if r.get("approval") == "rejected"),
         },
     }
 
@@ -779,34 +809,37 @@ class AssignIn(BaseModel):
 
 @router.post("/assignments")
 def create_assignment(body: AssignIn, principal: Principal = Depends(admin_only)):
-    v = db.one("select * from vehicles where id = ? and transporter_id = ?", (body.vehicle_id, body.transporter_id))
+    pid = _str_id(body.pool_id)
+    tid_owner = _str_id(body.transporter_id)
+    vid = _str_id(body.vehicle_id)
+    v = db.one("select * from vehicles where id = ? and transporter_id = ?", (vid, tid_owner))
     if not v:
         raise HTTPException(404, "Vehicle/transporter mismatch")
-    if not v["verified"]:
+    if not v.get("verified"):
         raise HTTPException(409, "Vehicle must be verified before assignment")
-    members = db.q("select * from shipments where pool_id = ?", (body.pool_id,))
+    members = db.q("select * from shipments where pool_id = ?", (pid,))
     if not members:
         raise HTTPException(404, "Pool has no shipments")
-    total_kg = sum(float(m["quantity_kg"]) for m in members)
-    if total_kg > float(v["payload_kg"]):
+    total_kg = sum(float(m["quantity_kg"] or 0) for m in members)
+    if total_kg > float(v["payload_kg"] or 0):
         raise HTTPException(409, f"Pool load {total_kg:,.0f} kg exceeds vehicle payload {v['payload_kg']:,} kg")
 
-    pending = [m for m in members if not m["coalition_id"]]
+    pending = [m for m in members if not m.get("coalition_id")]
     if pending:
         raise HTTPException(409, "Compute the fair-share allocation before assigning a vehicle")
 
-    dest = next((m for m in members if m["dest_lat"]), members[0])
+    dest = next((m for m in members if m.get("dest_lat")), members[0])
     km = sum(
-        road_km(m["pickup_lat"], m["pickup_lng"], dest["dest_lat"] or 30.7, dest["dest_lng"] or 76.2)
+        road_km(m["pickup_lat"], m["pickup_lng"], dest.get("dest_lat") or 30.7, dest.get("dest_lng") or 76.2)
         for m in members
     )
-    revenue = body.revenue or round(km * float(v["cost_per_km"]), 2)
+    revenue = body.revenue or round(km * float(v["cost_per_km"] or 22), 2)
     aid = uid("ASG")
     db.insert("transport_assignments", {
         "id": aid,
-        "pool_id": body.pool_id,
-        "transporter_id": body.transporter_id,
-        "vehicle_id": body.vehicle_id,
+        "pool_id": pid,
+        "transporter_id": tid_owner,
+        "vehicle_id": vid,
         "status": "proposed",
         "revenue": revenue,
         "distance_km": round(km, 2),
@@ -820,42 +853,43 @@ def create_assignment(body: AssignIn, principal: Principal = Depends(admin_only)
         "assignment_id": aid,
         "trip_code": f"CX-TRIP-{tid[-4:].upper()}",
         "status": "planned",
-        "vehicle_id": body.vehicle_id,
+        "vehicle_id": vid,
         "created_at": NOW(),
     })
     for m in members:
-        db.insert("trip_shipments", {"trip_id": tid, "shipment_id": m["id"]})
+        mid = _str_id(m["id"])
+        db.insert("trip_shipments", {"trip_id": tid, "shipment_id": mid})
         event(
-            m["id"],
+            mid,
             "assignment_proposed",
-            actor_id=principal["id"],
-            payload={"transporter_id": body.transporter_id, "vehicle": v["reg_no"]},
+            actor_id=_str_id(principal["id"]),
+            payload={"transporter_id": tid_owner, "vehicle": v["reg_no"]},
         )
         notify(
-            m["sender_id"],
+            _str_id(m["sender_id"]),
             f"Transport proposed for {m['code']}",
             f"{v['reg_no']} ({v['vehicle_class']}) · awaiting your approval and transporter acceptance.",
             "info",
-            f"/sender/shipments/{m['id']}",
+            f"/sender/shipments/{mid}",
         )
     notify(
-        body.transporter_id,
+        tid_owner,
         "New assignment offer",
-        f"{len(members)} consignment(s) on pool {body.pool_id} · ₹{revenue:,.0f}",
+        f"{len(members)} consignment(s) on pool {pid} · ₹{revenue:,.0f}",
         "action",
         "/transporter/assignments",
     )
     db.execute(
         "update capacity_blocks set status = 'reserved' where vehicle_id = ? and status = 'published'",
-        (body.vehicle_id,),
+        (vid,),
     )
-    db.execute("update vehicles set availability = 'assigned' where id = ?", (body.vehicle_id,))
+    db.execute("update vehicles set availability = 'assigned' where id = ?", (vid,))
     audit(
         principal,
         "assignment.create",
         entity_type="transport_assignment",
         entity_id=aid,
-        after={"pool_id": body.pool_id, "vehicle": body.vehicle_id, "revenue": revenue},
+        after={"pool_id": pid, "vehicle": vid, "revenue": revenue},
     )
     return {
         "assignment_id": aid,
@@ -884,7 +918,8 @@ def list_assignments():
 
 @router.post("/assignments/{assignment_id}/confirm")
 def confirm_assignment(assignment_id: str, principal: Principal = Depends(admin_only)):
-    a = db.one("select * from transport_assignments where id = ?", (assignment_id,))
+    aid = _str_id(assignment_id)
+    a = db.one("select * from transport_assignments where id = ?", (aid,))
     if not a:
         raise HTTPException(404, "Assignment not found")
     if a["status"] not in ("transporter_accepted", "sender_approved"):
@@ -895,42 +930,45 @@ def confirm_assignment(assignment_id: str, principal: Principal = Depends(admin_
     members = db.q(
         "select s.* from shipments s join trip_shipments ts on ts.shipment_id = s.id "
         "join trips t on t.id = ts.trip_id where t.assignment_id = ?",
-        (assignment_id,),
+        (aid,),
     )
-    unapproved = [m for m in members if not m["freight_approved"]]
+    unapproved = [m for m in members if not m.get("freight_approved")]
     if unapproved:
         raise HTTPException(409, "Sender approval is still missing for: " + ", ".join(m["code"] for m in unapproved))
     db.execute(
         "update transport_assignments set status = 'confirmed', updated_at = ? where id = ?",
-        (NOW(), assignment_id),
+        (NOW(), aid),
     )
     for m in members:
         set_status(m, "confirmed", actor=principal, note="Admin confirmed the assignment.")
-    audit(principal, "assignment.confirm", entity_type="transport_assignment", entity_id=assignment_id)
+    audit(principal, "assignment.confirm", entity_type="transport_assignment", entity_id=aid)
     return {"status": "confirmed"}
 
 
 @router.post("/assignments/{assignment_id}/cancel")
 def cancel_assignment(assignment_id: str, payload: dict, principal: Principal = Depends(admin_only)):
-    a = db.one("select * from transport_assignments where id = ?", (assignment_id,))
+    aid = _str_id(assignment_id)
+    a = db.one("select * from transport_assignments where id = ?", (aid,))
     if not a:
         raise HTTPException(404, "Assignment not found")
     db.execute(
         "update transport_assignments set status = 'cancelled', updated_at = ? where id = ?",
-        (NOW(), assignment_id),
+        (NOW(), aid),
     )
-    db.execute("update vehicles set availability = 'available' where id = ?", (a["vehicle_id"],))
-    db.execute(
-        "update capacity_blocks set status = 'published' where vehicle_id = ? and status='reserved'",
-        (a["vehicle_id"],),
-    )
+    if a.get("vehicle_id"):
+        vid = _str_id(a["vehicle_id"])
+        db.execute("update vehicles set availability = 'available' where id = ?", (vid,))
+        db.execute(
+            "update capacity_blocks set status = 'published' where vehicle_id = ? and status='reserved'",
+            (vid,),
+        )
     disruption = uid("DIS")
     db.insert("disruption_events", {
         "id": disruption,
         "trip_id": None,
         "event_type": payload.get("event_type", "cancellation"),
         "description": payload.get("reason", "Assignment cancelled by Admin"),
-        "reported_by": principal["id"],
+        "reported_by": _str_id(principal["id"]),
         "detected_at": NOW(),
         "severity": "high",
     })
@@ -938,7 +976,7 @@ def cancel_assignment(assignment_id: str, payload: dict, principal: Principal = 
         principal,
         "assignment.cancel",
         entity_type="transport_assignment",
-        entity_id=assignment_id,
+        entity_id=aid,
         after={"reason": payload.get("reason")},
     )
     return {
@@ -963,37 +1001,38 @@ class DeliveryIn(BaseModel):
 
 @router.post("/deliveries")
 def record_delivery(body: DeliveryIn, principal: Principal = Depends(admin_only)):
-    s = get_shipment(body.shipment_id)
+    sid = _str_id(body.shipment_id)
+    s = get_shipment(sid)
     if not s:
         raise HTTPException(404, "Shipment not found")
     did = uid("DEL")
     db.insert("delivery_confirmations", {
         "id": did,
-        "shipment_id": s["id"],
+        "shipment_id": sid,
         "trip_id": None,
         "delivered_qty_kg": body.delivered_qty_kg,
         "pod_ref": body.pod_ref,
         "external_ack_ref": body.external_ack_ref,
         "shortage_note": body.shortage_note,
         "damage_note": body.damage_note,
-        "recorded_by": principal["id"],
-        "verified_by": principal["id"] if body.verify else None,
+        "recorded_by": _str_id(principal["id"]),
+        "verified_by": _str_id(principal["id"]) if body.verify else None,
         "status": "admin_verified" if body.verify else "recorded",
         "created_at": NOW(),
     })
     if body.verify:
         set_status(s, "delivered", actor=principal, note="Delivery verified by Admin.")
     event(
-        s["id"],
+        sid,
         "delivery_recorded",
-        actor_id=principal["id"],
+        actor_id=_str_id(principal["id"]),
         payload={"delivered_qty_kg": body.delivered_qty_kg, "verified": body.verify},
     )
     audit(
         principal,
         "delivery.record",
         entity_type="shipment",
-        entity_id=s["id"],
+        entity_id=sid,
         after={"verified": body.verify},
     )
     return {"id": did, "status": "admin_verified" if body.verify else "recorded"}
@@ -1022,20 +1061,21 @@ def list_trips():
                     left join profiles p on p.id = ta.transporter_id
                     order by t.created_at desc""")
     for t in trips:
+        tid = _str_id(t["id"])
+        t["id"] = tid
         t["shipments"] = db.q(
             """select s.id, s.code, s.commodity, s.quantity_kg, s.status, s.destination_name,
                       s.pickup_village, s.pickup_lat, s.pickup_lng
                from shipments s join trip_shipments ts on ts.shipment_id = s.id
                where ts.trip_id = ?""",
-            (t["id"],),
+            (tid,),
         )
-        t["legs"] = db.q("select * from trip_legs where trip_id = ? order by leg_no", (t["id"],))
+        t["legs"] = db.q("select * from trip_legs where trip_id = ? order by leg_no", (tid,))
     return {"items": trips}
 
 
 @router.get("/tower")
 def control_tower():
-    """Everything the digital-twin map needs in one payload."""
     shipments = db.q("select * from shipments where status not in ('cancelled')")
     return {
         "villages": db.q("select * from villages"),
@@ -1043,7 +1083,7 @@ def control_tower():
         "mandis": db.q("select * from mandis"),
         "road_edges": db.q("select * from road_edges"),
         "vehicles": db.q(
-            "select v.*, p.full_name as transporter_name from vehicles v join profiles p on p.id = v.transporter_id"
+            "select v.*, p.full_name as transporter_name from vehicles v left join profiles p on p.id = v.transporter_id"
         ),
         "shipments": [shipment_view(s) for s in shipments],
         "trips": db.q("""select t.*, ta.transporter_id, v.reg_no from trips t
@@ -1071,7 +1111,7 @@ def system_health():
     return {
         "db_dialect": db.dialect(),
         "tables": {
-            t: db.scalar(f"select count(*) from {t}", default=0)
+            t: int(db.scalar(f"select count(*) from {t}", default=0) or 0)
             for t in (
                 "profiles",
                 "shipments",

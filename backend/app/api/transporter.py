@@ -17,6 +17,15 @@ def _tid(principal: Principal) -> str:
     return str(principal["id"])
 
 
+def _is_postgres() -> bool:
+    return (db.dialect() or "").lower() in ("postgres", "postgresql")
+
+
+def _approved_true_sql(alias: str = "s") -> str:
+    col = f"{alias}.freight_approved" if alias else "freight_approved"
+    return f"coalesce({col}, false) is true" if _is_postgres() else f"coalesce({col}, 0) = 1"
+
+
 # --------------------------------------------------------------------------- #
 # assignments visible to the transporter
 # --------------------------------------------------------------------------- #
@@ -34,23 +43,29 @@ def available_assignments(principal: Principal = Depends(transporter_only)):
         (tid,),
     )
     for r in rows:
+        aid = str(r["id"])
+        r["id"] = aid
         r["shipments"] = db.q(
             """select s.id, s.code, s.commodity, s.quantity_kg, s.pickup_village, s.destination_name,
                       s.pickup_lat, s.pickup_lng, s.dest_lat, s.dest_lng, s.deadline, s.status
                from shipments s join trip_shipments ts on ts.shipment_id = s.id
                join trips t on t.id = ts.trip_id where t.assignment_id = ?""",
-            (str(r["id"]),),
+            (aid,),
         )
-        r["sender_approved"] = all(
-            bool(db.scalar("select freight_approved from shipments where id = ?", (str(s["id"]),), 0))
-            for s in r["shipments"]
-        ) if r["shipments"] else False
-        r["arrival"] = arrival.clock_for(str(r["id"]))
+        r["sender_approved"] = (
+            all(
+                bool(db.scalar(f"select {_approved_true_sql('')} from shipments where id = ?", (str(s["id"]),), False))
+                for s in r["shipments"]
+            )
+            if r["shipments"]
+            else False
+        )
+        r["arrival"] = arrival.clock_for(aid)
     return {
         "items": rows,
-        "open": [r for r in rows if r["status"] == "proposed"],
-        "active": [r for r in rows if r["status"] in ("transporter_accepted", "sender_approved", "confirmed")],
-        "completed": [r for r in rows if r["status"] in ("completed", "cancelled", "transporter_rejected")],
+        "open": [r for r in rows if r.get("status") == "proposed"],
+        "active": [r for r in rows if r.get("status") in ("transporter_accepted", "sender_approved", "confirmed")],
+        "completed": [r for r in rows if r.get("status") in ("completed", "cancelled", "transporter_rejected")],
     }
 
 
@@ -66,32 +81,33 @@ def respond_assignment(
     principal: Principal = Depends(transporter_only),
 ):
     tid = _tid(principal)
-    a = db.one("select * from transport_assignments where id = ? and transporter_id = ?", (assignment_id, tid))
+    aid = str(assignment_id)
+    a = db.one("select * from transport_assignments where id = ? and transporter_id = ?", (aid, tid))
     if not a:
         raise HTTPException(404, "Assignment not found for this account")
-    if a["status"] not in ("proposed", "transporter_rejected"):
-        raise HTTPException(409, f"Assignment is already '{a['status']}'")
+    if a.get("status") not in ("proposed", "transporter_rejected"):
+        raise HTTPException(409, f"Assignment is already '{a.get('status')}'")
     if body.action == "accept":
         members = db.q(
             """select s.* from shipments s join trip_shipments ts on ts.shipment_id = s.id
                join trips t on t.id = ts.trip_id where t.assignment_id = ?""",
-            (assignment_id,),
+            (aid,),
         )
-        missing = [m["code"] for m in members if not m["freight_approved"]]
+        missing = [m["code"] for m in members if not m.get("freight_approved")]
         if missing:
             raise HTTPException(409, "Sender approval is still pending for: " + ", ".join(missing))
         accepted_at = NOW()
         db.execute(
             "update transport_assignments set status = 'transporter_accepted', accepted_at = ?, updated_at = ? where id = ?",
-            (accepted_at, accepted_at, assignment_id),
+            (accepted_at, accepted_at, aid),
         )
         msg = "Assignment accepted. Admin will confirm dispatch after the readiness check-in."
-    else:
+    elif body.action == "reject":
         if not body.reason:
             raise HTTPException(400, "A reason is required to reject an assignment")
         db.execute(
             "update transport_assignments set status = 'transporter_rejected', updated_at = ? where id = ?",
-            (NOW(), assignment_id),
+            (NOW(), aid),
         )
         did = uid("DIS")
         db.insert(
@@ -109,16 +125,18 @@ def respond_assignment(
         for admin in db.q("select id from profiles where role='admin'"):
             notify(str(admin["id"]), "Transporter rejected an assignment", body.reason, "warning", "/admin/recovery")
         msg = "Assignment rejected. Admin has been notified to run ShadowFleet-Heal."
+    else:
+        raise HTTPException(400, "action must be 'accept' or 'reject'")
     audit(
         principal,
         f"assignment.{body.action}",
         entity_type="transport_assignment",
-        entity_id=assignment_id,
+        entity_id=aid,
         after={"reason": body.reason},
     )
     out = {"status": "accepted" if body.action == "accept" else "rejected", "message": msg}
     if body.action == "accept":
-        out["arrival"] = arrival.clock_for(assignment_id)
+        out["arrival"] = arrival.clock_for(aid)
     return out
 
 
@@ -126,10 +144,11 @@ def respond_assignment(
 def assignment_arrival(assignment_id: str, principal: Principal = Depends(transporter_only)):
     """The pickup arrival clock for one accepted assignment (single source of truth)."""
     tid = _tid(principal)
-    a = db.one("select * from transport_assignments where id = ? and transporter_id = ?", (assignment_id, tid))
+    aid = str(assignment_id)
+    a = db.one("select * from transport_assignments where id = ? and transporter_id = ?", (aid, tid))
     if not a:
         raise HTTPException(404, "Assignment not found for this account")
-    clock = arrival.clock_for(assignment_id)
+    clock = arrival.clock_for(aid)
     if not clock:
         raise HTTPException(404, "Assignment not found")
     return clock
@@ -150,6 +169,7 @@ def my_trips(principal: Principal = Depends(transporter_only)):
     )
     for t in trips:
         trip_id = str(t["id"])
+        t["id"] = trip_id
         t["shipments"] = db.q(
             """select s.id, s.code, s.commodity, s.quantity_kg, s.status, s.pickup_village,
                       s.destination_name, s.pickup_lat, s.pickup_lng
@@ -157,7 +177,7 @@ def my_trips(principal: Principal = Depends(transporter_only)):
             (trip_id,),
         )
         t["legs"] = db.q("select * from trip_legs where trip_id = ? order by leg_no", (trip_id,))
-        t["next_action"] = _next_action(t["status"])
+        t["next_action"] = _next_action(t.get("status") or "planned")
         t["arrival"] = arrival.clock_for(str(t["assignment_id"])) if t.get("assignment_id") else None
     return {"items": trips}
 
@@ -193,27 +213,28 @@ TRIP_TRANSITIONS = {
 @router.post("/trips/{trip_id}/action")
 def trip_action(trip_id: str, body: TripActionIn, principal: Principal = Depends(transporter_only)):
     tid = _tid(principal)
+    trip_key = str(trip_id)
     t = db.one(
         """select t.*, ta.transporter_id from trips t
            left join transport_assignments ta on ta.id = t.assignment_id where t.id = ?""",
-        (trip_id,),
+        (trip_key,),
     )
     if not t or str(t.get("transporter_id") or "") != tid:
         raise HTTPException(404, "Trip not found for this account")
     shipments = db.q(
         """select s.* from shipments s join trip_shipments ts on ts.shipment_id = s.id
            where ts.trip_id = ?""",
-        (trip_id,),
+        (trip_key,),
     )
 
     if body.action in ("report_delay", "breakdown"):
-        db.execute("update trips set delay_reported = ? where id = ?", (body.note or body.action, trip_id))
+        db.execute("update trips set delay_reported = ? where id = ?", (body.note or body.action, trip_key))
         did = uid("DIS")
         db.insert(
             "disruption_events",
             {
                 "id": did,
-                "trip_id": trip_id,
+                "trip_id": trip_key,
                 "event_type": "breakdown" if body.action == "breakdown" else "delay",
                 "description": body.note or body.action,
                 "reported_by": tid,
@@ -224,18 +245,18 @@ def trip_action(trip_id: str, body: TripActionIn, principal: Principal = Depends
         for admin in db.q("select id from profiles where role='admin'"):
             notify(
                 str(admin["id"]),
-                f"Trip {t['trip_code']}: {body.action.replace('_', ' ')}",
+                f"Trip {t.get('trip_code') or trip_key}: {body.action.replace('_', ' ')}",
                 body.note or "",
                 "warning",
                 "/admin/recovery",
             )
-        event(trip_id, body.action, entity_type="trip", actor_id=tid, payload={"note": body.note})
+        event(trip_key, body.action, entity_type="trip", actor_id=tid, payload={"note": body.note})
         return {"disruption_id": did, "message": "Reported. Admin can run ShadowFleet-Heal for recovery options."}
 
     if body.action == "confirm_delivery":
         if not shipments:
             raise HTTPException(409, "This trip has no shipments")
-        db.execute("update trips set status = 'delivered', finished_at = ? where id = ?", (NOW(), trip_id))
+        db.execute("update trips set status = 'delivered', finished_at = ? where id = ?", (NOW(), trip_key))
         for s in shipments:
             sid = str(s["id"])
             db.insert(
@@ -243,9 +264,9 @@ def trip_action(trip_id: str, body: TripActionIn, principal: Principal = Depends
                 {
                     "id": uid("DEL"),
                     "shipment_id": sid,
-                    "trip_id": trip_id,
-                    "delivered_qty_kg": s["quantity_kg"],
-                    "pod_ref": f"storage://pod/{trip_id}-{s['code']}.jpg",
+                    "trip_id": trip_key,
+                    "delivered_qty_kg": s.get("quantity_kg"),
+                    "pod_ref": f"storage://pod/{trip_key}-{s.get('code') or sid}.jpg",
                     "recorded_by": tid,
                     "status": "recorded",
                     "created_at": NOW(),
@@ -253,7 +274,7 @@ def trip_action(trip_id: str, body: TripActionIn, principal: Principal = Depends
             )
             set_status(
                 s,
-                "out_for_delivery" if s["status"] != "delivered" else s["status"],
+                "out_for_delivery" if s.get("status") != "delivered" else s["status"],
                 actor=principal,
                 note="Transporter arrived at destination; awaiting Admin verification.",
             )
@@ -261,14 +282,14 @@ def trip_action(trip_id: str, body: TripActionIn, principal: Principal = Depends
                 sid,
                 "delivery_reported",
                 actor_id=tid,
-                payload={"pod_ref": f"storage://pod/{trip_id}-{s['code']}.jpg"},
+                payload={"pod_ref": f"storage://pod/{trip_key}-{s.get('code') or sid}.jpg"},
             )
         if t.get("vehicle_id"):
             db.execute("update vehicles set availability = 'available' where id = ?", (str(t["vehicle_id"]),))
         for admin in db.q("select id from profiles where role='admin'"):
             notify(
                 str(admin["id"]),
-                f"Delivery reported for {t['trip_code']}",
+                f"Delivery reported for {t.get('trip_code') or trip_key}",
                 "Verify POD and external destination acknowledgement to close the shipment.",
                 "action",
                 "/admin/deliveries",
@@ -278,11 +299,11 @@ def trip_action(trip_id: str, body: TripActionIn, principal: Principal = Depends
     t_from, t_to, note = TRIP_TRANSITIONS.get(body.action, (None, None, ""))
     if not t_to:
         raise HTTPException(400, f"Unknown action '{body.action}'")
-    if t["status"] != t_from:
-        raise HTTPException(409, f"Trip is '{t['status']}' — '{body.action}' requires '{t_from}'")
+    if t.get("status") != t_from:
+        raise HTTPException(409, f"Trip is '{t.get('status')}' — '{body.action}' requires '{t_from}'")
     db.execute(
         "update trips set status = ?, started_at = coalesce(started_at, ?) where id = ?",
-        (t_to, NOW() if body.action == "start" else None, trip_id),
+        (t_to, NOW() if body.action == "start" else None, trip_key),
     )
     status_map = {
         "loading": "ready_for_pickup",
@@ -292,8 +313,8 @@ def trip_action(trip_id: str, body: TripActionIn, principal: Principal = Depends
     }
     for s in shipments:
         set_status(s, status_map[t_to], actor=principal, note=note)
-    event(trip_id, f"trip_{body.action}", entity_type="trip", actor_id=tid, payload={"to": t_to})
-    audit(principal, f"trip.{body.action}", entity_type="trip", entity_id=trip_id, after={"status": t_to})
+    event(trip_key, f"trip_{body.action}", entity_type="trip", actor_id=tid, payload={"to": t_to})
+    audit(principal, f"trip.{body.action}", entity_type="trip", entity_id=trip_key, after={"status": t_to})
     return {"status": t_to, "message": note}
 
 
@@ -304,35 +325,42 @@ def trip_action(trip_id: str, body: TripActionIn, principal: Principal = Depends
 def return_loads(trip_id: str | None = None, principal: Principal = Depends(transporter_only)):
     tid = _tid(principal)
     trips = db.q(
-        """select t.*, v.vehicle_class, v.payload_kg, s.dest_lat, s.dest_lng
-           from trips t left join vehicles v on v.id = t.vehicle_id
+        """select t.*, v.vehicle_class, v.payload_kg, v.cost_per_km, s.dest_lat, s.dest_lng
+           from trips t
+           join transport_assignments ta on ta.id = t.assignment_id
+           left join vehicles v on v.id = t.vehicle_id
            left join trip_shipments ts on ts.trip_id = t.id
            left join shipments s on s.id = ts.shipment_id
-           where (t.assignment_id in (select id from transport_assignments where transporter_id = ?))
+           where ta.transporter_id = ?
            order by t.created_at desc""",
         (tid,),
     )
-    trip = next((x for x in trips if str(x["id"]) == trip_id), trips[0] if trips else None)
+    trip = next((x for x in trips if str(x["id"]) == str(trip_id or "")), trips[0] if trips else None)
+    existing = db.q("select * from return_load_offers where transporter_id = ? order by created_at desc", (tid,))
     if not trip:
-        return {"items": [], "note": "No trips yet — return-load matching needs an executed trip corridor."}
+        return {
+            "items": [],
+            "offers": existing,
+            "note": "No trips yet — return-load matching needs an executed trip corridor.",
+        }
+    actual_trip_id = str(trip["id"])
     v = db.one("select * from vehicles where id = ?", (str(trip["vehicle_id"]),)) if trip.get("vehicle_id") else None
     outbound = db.one(
         """select s.commodity from shipments s join trip_shipments ts on ts.shipment_id = s.id
            where ts.trip_id = ? limit 1""",
-        (str(trip["id"]),),
+        (actual_trip_id,),
     )
     opps = backhaul.opportunities(
-        trip_end=(trip["dest_lat"] or 30.9, trip["dest_lng"] or 75.85),
+        trip_end=(float(trip.get("dest_lat") or 30.9), float(trip.get("dest_lng") or 75.85)),
         next_committed=(30.8421, 76.1520),
-        vehicle_class=v["vehicle_class"] if v else "lcv",
-        capacity_kg=int(v["payload_kg"]) if v else 7500,
-        outbound_commodity=(outbound or {}).get("commodity", "wheat"),
-        cost_per_km=float(v["cost_per_km"]) if v else 22,
+        vehicle_class=(v.get("vehicle_class") if v else None) or trip.get("vehicle_class") or "lcv",
+        capacity_kg=int((v.get("payload_kg") if v else None) or trip.get("payload_kg") or 7500),
+        outbound_commodity=(outbound or {}).get("commodity") or "wheat",
+        cost_per_km=float((v.get("cost_per_km") if v else None) or trip.get("cost_per_km") or 22),
     )
-    existing = db.q("select * from return_load_offers where transporter_id = ? order by created_at desc", (tid,))
     return {
         "items": opps,
-        "trip_id": str(trip["id"]),
+        "trip_id": actual_trip_id,
         "offers": existing,
         "note": "Return loads are suggestions only. Accept only when revenue beats incremental cost.",
     }
