@@ -105,10 +105,13 @@ def _format_destination_point(body: ShipmentIn, dlat: float | None, dlng: float 
         return body.destination_point.strip()
     if dlat is not None and dlng is not None:
         return _wkt_point(dlat, dlng)
-    parts = [p.strip() for p in (body.destination_name, body.drop_district, body.drop_state) if p and p.strip()]
-    if parts:
-        return _wkt_point(body.pickup_lat, body.pickup_lng)
     return _wkt_point(body.pickup_lat, body.pickup_lng)
+
+
+def _lookup_shipment_id(row: dict | None, fallback: str) -> str:
+    if row and row.get("id"):
+        return str(row["id"])
+    return fallback
 
 
 @router.post("/shipments")
@@ -132,7 +135,7 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
     pickup_point_val = _format_pickup_point(body)
     destination_point_val = _format_destination_point(body, dlat, dlng)
 
-    db.insert("shipments", {
+    inserted = db.insert("shipments", {
         "id": sid,
         "code": code,
         "sender_id": principal["id"],
@@ -170,11 +173,14 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
         "updated_at": now,
     })
 
+    created_row = get_shipment(code) or inserted
+    real_sid = _lookup_shipment_id(created_row, sid)
+
     if not body.items:
         try:
             db.insert("shipment_items", {
                 "id": uid("ITM"),
-                "shipment_id": sid,
+                "shipment_id": real_sid,
                 "commodity": body.commodity,
                 "quantity_kg": qty,
                 "packaging": body.packaging,
@@ -190,7 +196,7 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
         try:
             db.insert("shipment_items", {
                 "id": uid("ITM"),
-                "shipment_id": sid,
+                "shipment_id": real_sid,
                 "commodity": label[:120],
                 "quantity_kg": grams,
                 "packaging": it.packaging or body.packaging,
@@ -203,7 +209,7 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
         try:
             db.insert("shipment_destinations", {
                 "id": uid("DST"),
-                "shipment_id": sid,
+                "shipment_id": real_sid,
                 "name": dname,
                 "kind": "mandi",
                 "lat": dlat,
@@ -219,7 +225,7 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
         try:
             db.insert("shipment_destinations", {
                 "id": uid("DST"),
-                "shipment_id": sid,
+                "shipment_id": real_sid,
                 "name": opt.get("name", "Alternative"),
                 "kind": "mandi",
                 "lat": opt.get("lat"),
@@ -232,13 +238,13 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
             pass
 
     try:
-        event(sid, "shipment_created", actor_id=principal["id"],
+        event(real_sid, "shipment_created", actor_id=principal["id"],
               payload={"status": status, "quantity_kg": qty, "commodity": body.commodity})
     except Exception:
         pass
 
     try:
-        audit(principal, "shipment.create", entity_type="shipment", entity_id=sid, after={"status": status})
+        audit(principal, "shipment.create", entity_type="shipment", entity_id=real_sid, after={"status": status})
     except Exception:
         pass
 
@@ -255,7 +261,10 @@ def create_shipment(body: ShipmentIn, principal: Principal = Depends(sender_only
         except Exception:
             pass
 
-    return {"shipment": shipment_view(get_shipment(sid)), "message": f"Shipment {code} created and sent for admin verification."}
+    return {
+        "shipment": shipment_view(get_shipment(code) or created_row),
+        "message": f"Shipment {code} created and sent for admin verification.",
+    }
 
 
 @router.get("/shipments")
@@ -332,12 +341,12 @@ def update_shipment(shipment_id: str, body: ShipmentIn, principal: Principal = D
             body.ready_from, body.ready_to, body.deadline, body.packaging, body.handling, body.temperature,
             body.special_instructions,
             "pending_admin_review" if row["status"] == "draft" else row["status"],
-            NOW(), shipment_id,
+            NOW(), row["id"],
         ),
     )
-    event(shipment_id, "shipment_updated", actor_id=principal["id"], payload={"fields": "core"})
-    audit(principal, "shipment.update", entity_type="shipment", entity_id=shipment_id, before=before)
-    return shipment_view(get_shipment(shipment_id))
+    event(row["id"], "shipment_updated", actor_id=principal["id"], payload={"fields": "core"})
+    audit(principal, "shipment.update", entity_type="shipment", entity_id=row["id"], before=before)
+    return shipment_view(get_shipment(row["code"]) or get_shipment(row["id"]))
 
 
 @router.post("/shipments/{shipment_id}/cancel")
@@ -350,13 +359,13 @@ def cancel_shipment(shipment_id: str, payload: dict | None = None, principal: Pr
     if row["status"] in ("in_transit", "at_transfer_hub", "out_for_delivery", "delivered", "cancelled"):
         raise HTTPException(409, "A shipment already in execution cannot be cancelled here — contact Admin.")
     before = row["status"]
-    db.execute("update shipments set status = 'cancelled', updated_at = ? where id = ?", (NOW(), shipment_id))
-    event(shipment_id, "shipment_cancelled", actor_id=principal["id"], payload={"reason": (payload or {}).get("reason")})
-    audit(principal, "shipment.cancel", entity_type="shipment", entity_id=shipment_id,
+    db.execute("update shipments set status = 'cancelled', updated_at = ? where id = ?", (NOW(), row["id"]))
+    event(row["id"], "shipment_cancelled", actor_id=principal["id"], payload={"reason": (payload or {}).get("reason")})
+    audit(principal, "shipment.cancel", entity_type="shipment", entity_id=row["id"],
           before={"status": before}, after={"status": "cancelled"})
     for admin in db.q("select id from profiles where role = 'admin'"):
         notify(admin["id"], f"{row['code']} cancelled by sender", (payload or {}).get("reason") or "", "warning", "/admin/shipments")
-    return shipment_view(get_shipment(shipment_id))
+    return shipment_view(get_shipment(row["code"]) or get_shipment(row["id"]))
 
 
 @router.post("/shipments/{shipment_id}/approve-allocation")
@@ -368,24 +377,24 @@ def approve_allocation(shipment_id: str, payload: dict, principal: Principal = D
         raise HTTPException(404, "Shipment not found")
     if row["sender_id"] != principal["id"]:
         raise HTTPException(403, "Not your shipment")
-    alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (shipment_id,))
+    alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (row["id"],))
     if not alloc:
         raise HTTPException(409, "No allocation proposal exists for this shipment yet")
     if not accept and payload.get("reason") is None:
         raise HTTPException(400, "A reason is required when rejecting an allocation")
     db.execute("update cost_allocations set approval = ? where id = ?", ("approved" if accept else "rejected", alloc["id"]))
     db.execute("update shipments set freight_estimate = ?, freight_approved = ?, updated_at = ? where id = ?",
-               (alloc["allocated_share"], 1 if accept else 0, NOW(), shipment_id))
-    event(shipment_id, "allocation_" + ("approved" if accept else "rejected"), actor_id=principal["id"],
+               (alloc["allocated_share"], 1 if accept else 0, NOW(), row["id"]))
+    event(row["id"], "allocation_" + ("approved" if accept else "rejected"), actor_id=principal["id"],
           payload={"allocated_share": alloc["allocated_share"], "reason": payload.get("reason")})
-    audit(principal, "allocation.respond", entity_type="shipment", entity_id=shipment_id,
+    audit(principal, "allocation.respond", entity_type="shipment", entity_id=row["id"],
           after={"approval": "approved" if accept else "rejected"})
     for admin in db.q("select id from profiles where role = 'admin'"):
         notify(admin["id"], f"{row['code']} allocation {'approved' if accept else 'rejected'}",
                f"₹{alloc['allocated_share']:,.0f} · {row['commodity']}", "action" if not accept else "success",
                "/admin/shipments")
     return {"approval": "approved" if accept else "rejected",
-            "shipment": shipment_view(get_shipment(shipment_id)),
+            "shipment": shipment_view(get_shipment(row["code"]) or get_shipment(row["id"])),
             "message": "Allocation approved. Admin can now confirm the assignment." if accept
             else "Allocation rejected. Admin will re-plan this load."}
 
@@ -399,12 +408,12 @@ def readiness_checkin(shipment_id: str, payload: dict, principal: Principal = De
     state = payload.get("state")
     if state not in ("ready", "delayed"):
         raise HTTPException(400, "state must be 'ready' or 'delayed'")
-    event(shipment_id, "readiness_confirmed", actor_id=principal["id"],
+    event(row["id"], "readiness_confirmed", actor_id=principal["id"],
           payload={"state": state, "confirmed_kg": payload.get("confirmed_kg"), "note": payload.get("note")})
     asg = db.one(
         """select ta.* from transport_assignments ta join trips t on t.assignment_id = ta.id
            join trip_shipments ts on ts.trip_id = t.id where ts.shipment_id = ? limit 1""",
-        (shipment_id,),
+        (row["id"],),
     )
     if asg:
         db.execute("update transport_assignments set ready_check = ?, updated_at = ? where id = ?",
@@ -423,8 +432,8 @@ def tracking(shipment_id: str, principal: Principal = Depends(any_role)):
         raise HTTPException(404, "Shipment not found")
     if principal["role"] == "sender" and row["sender_id"] != principal["id"]:
         raise HTTPException(403, "Not your shipment")
-    events = db.q("select * from shipment_events where entity_id = ? order by created_at asc", (shipment_id,))
-    trip = db.one("select t.* from trips t join trip_shipments ts on ts.trip_id = t.id where ts.shipment_id = ? limit 1", (shipment_id,))
+    events = db.q("select * from shipment_events where entity_id = ? order by created_at asc", (row["id"],))
+    trip = db.one("select t.* from trips t join trip_shipments ts on ts.trip_id = t.id where ts.shipment_id = ? limit 1", (row["id"],))
     legs = db.q("select * from trip_legs where trip_id = ? order by leg_no", (trip["id"],)) if trip else []
     order = ["draft", "pending_admin_review", "planning", "matched", "awaiting_sender_approval",
              "confirmed", "ready_for_pickup", "in_transit", "at_transfer_hub", "out_for_delivery", "delivered"]
@@ -465,7 +474,7 @@ def recommend_destinations(shipment_id: str, principal: Principal = Depends(any_
             "confidence": 0.62 if price else 0.3,
             "price_source": "synthetic market observation" if price else "no observation",
         })
-    alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (shipment_id,))
+    alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (row["id"],))
     freight = alloc["allocated_share"] if alloc else row["freight_estimate"]
     result = valueclock.evaluate_destinations(
         commodity=row["commodity"], quantity_kg=float(row["quantity_kg"]),
@@ -482,12 +491,12 @@ def cost_breakdown(shipment_id: str, principal: Principal = Depends(any_role)):
         raise HTTPException(404, "Shipment not found")
     if principal["role"] == "sender" and row["sender_id"] != principal["id"]:
         raise HTTPException(403, "Not your shipment")
-    alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (shipment_id,))
+    alloc = db.one("select * from cost_allocations where shipment_id = ? order by created_at desc limit 1", (row["id"],))
     coalition = db.one("select * from coalitions where id = ?", (alloc["coalition_id"],)) if alloc else None
     peers = db.q(
         """select ca.*, s.code, s.commodity, s.quantity_kg from cost_allocations ca
            join shipments s on s.id = ca.shipment_id where ca.coalition_id = ? and ca.shipment_id <> ?""",
-        (alloc["coalition_id"], shipment_id),
+        (alloc["coalition_id"], row["id"]),
     ) if alloc else []
     return {
         "shipment": {"code": row["code"], "quantity_kg": row["quantity_kg"], "commodity": row["commodity"]},
