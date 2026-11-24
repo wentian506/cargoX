@@ -26,6 +26,8 @@ _lock = threading.RLock()
 _state: dict[str, Any] = {"conn": None, "dialect": "sqlite"}
 _col_cache: dict[tuple[str, str], set[str]] = {}
 _uuid_col_cache: dict[tuple[str, str], set[str]] = {}
+_geom_col_cache: dict[tuple[str, str], set[str]] = {}
+_array_col_cache: dict[tuple[str, str], set[str]] = {}
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -88,7 +90,7 @@ def _table_columns(table: str) -> set[str] | None:
         return _col_cache[key]
     if d == "postgres":
         rows = q(
-            "select column_name, data_type from information_schema.columns "
+            "select column_name, data_type, udt_name from information_schema.columns "
             "where table_schema = 'public' and table_name = ?",
             (table,),
         )
@@ -98,9 +100,23 @@ def _table_columns(table: str) -> set[str] | None:
             for r in rows
             if (r.get("data_type") or "").lower() == "uuid"
         }
+        geom_cols = {
+            r["column_name"]
+            for r in rows
+            if (r.get("udt_name") or "").lower() in ("geometry", "geography")
+            or "geometry" in (r.get("data_type") or "").lower()
+        }
+        array_cols = {
+            r["column_name"]
+            for r in rows
+            if (r.get("data_type") or "").lower() == "array"
+            or (r.get("udt_name") or "").startswith("_")
+        }
         if cols:
             _col_cache[key] = cols
             _uuid_col_cache[key] = uuid_cols
+            _geom_col_cache[key] = geom_cols
+            _array_col_cache[key] = array_cols
             return cols
         return None
     rows = q(f"pragma table_info({table})")
@@ -108,6 +124,8 @@ def _table_columns(table: str) -> set[str] | None:
     if cols:
         _col_cache[key] = cols
         _uuid_col_cache[key] = set()
+        _geom_col_cache[key] = set()
+        _array_col_cache[key] = set()
         return cols
     return None
 
@@ -115,6 +133,16 @@ def _table_columns(table: str) -> set[str] | None:
 def _uuid_columns(table: str) -> set[str]:
     _table_columns(table)
     return _uuid_col_cache.get((_state["dialect"], table), set())
+
+
+def _geom_columns(table: str) -> set[str]:
+    _table_columns(table)
+    return _geom_col_cache.get((_state["dialect"], table), set())
+
+
+def _array_columns(table: str) -> set[str]:
+    _table_columns(table)
+    return _array_col_cache.get((_state["dialect"], table), set())
 
 
 def _coerce_uuid_value(val: Any) -> str:
@@ -125,10 +153,49 @@ def _coerce_uuid_value(val: Any) -> str:
     return str(uuid.uuid4())
 
 
+def _to_wkt_point(lat: Any, lon: Any, fallback: tuple[float, float] = (25.5941, 85.1376)) -> str:
+    try:
+        use_lat = float(lat) if lat is not None else fallback[0]
+        use_lon = float(lon) if lon is not None else fallback[1]
+        return f"SRID=4326;POINT({use_lon} {use_lat})"
+    except Exception:
+        return f"SRID=4326;POINT({fallback[1]} {fallback[0]})"
+
+
+def _coerce_geom_value(val: Any, col: str, data: dict[str, Any]) -> Any:
+    if val is None:
+        return None
+    if isinstance(val, str):
+        stripped = val.strip()
+        if stripped.upper().startswith(("SRID=", "POINT", "LINESTRING", "POLYGON", "MULTIPOINT")):
+            return val
+    if "dest" in col or "drop" in col:
+        return _to_wkt_point(
+            data.get("dest_lat"),
+            data.get("dest_lng"),
+            fallback=(float(data.get("pickup_lat") or 25.5941), float(data.get("pickup_lng") or 85.1376)),
+        )
+    return _to_wkt_point(data.get("pickup_lat"), data.get("pickup_lng"))
+
+
+def _coerce_array_value(val: Any) -> Any:
+    if val is None or isinstance(val, (list, tuple)):
+        return list(val) if isinstance(val, tuple) else val
+    if isinstance(val, str):
+        parts = [p.strip() for p in val.split(",") if p.strip()]
+        return parts if parts else ([val.strip()] if val.strip() else [])
+    return [val]
+
+
 def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in row.items():
-        out[k] = str(v) if isinstance(v, uuid.UUID) else v
+        if isinstance(v, uuid.UUID):
+            out[k] = str(v)
+        elif isinstance(v, list):
+            out[k] = ", ".join(str(x) for x in v)
+        else:
+            out[k] = v
     return out
 
 
@@ -199,15 +266,34 @@ def insert(table: str, data: dict) -> dict:
         filtered = dict(data)
     if _state["dialect"] == "postgres":
         uuid_cols = _uuid_columns(table)
+        geom_cols = _geom_columns(table)
+        array_cols = _array_columns(table)
         for col in uuid_cols:
             if col in filtered and filtered[col] is not None:
                 filtered[col] = _coerce_uuid_value(filtered[col])
+        for col in geom_cols:
+            if col in filtered and filtered[col] is not None:
+                filtered[col] = _coerce_geom_value(filtered[col], col, data)
+        for col in array_cols:
+            if col in filtered and filtered[col] is not None:
+                filtered[col] = _coerce_array_value(filtered[col])
     cols = list(filtered.keys())
     ph = ", ".join("?" for _ in cols)
     query = f"insert into {table} ({', '.join(cols)}) values ({ph})"
     if _state["dialect"] == "postgres":
-        rows = q(query + " returning *", [filtered[c] for c in cols])
-        return rows[0] if rows else _normalize_row(filtered)
+        try:
+            rows = q(query + " returning *", [filtered[c] for c in cols])
+            return rows[0] if rows else _normalize_row(filtered)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "invalid geometry" in msg or "geometry" in msg:
+                retry = dict(filtered)
+                for k, v in list(retry.items()):
+                    if isinstance(v, str) and k not in ("id", "code", "sender_id", "status", "unit", "direction"):
+                        retry[k] = _coerce_geom_value(v, k, data)
+                rows = q(query + " returning *", [retry[c] for c in cols])
+                return rows[0] if rows else _normalize_row(retry)
+            raise
     execute(query, [filtered[c] for c in cols])
     return filtered
 
