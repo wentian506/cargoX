@@ -39,21 +39,43 @@ class CapacityIn(BaseModel):
     cancellation_terms: str = "Free withdrawal before T-24h; 8% standby fee thereafter (fictional credit)."
 
 
+def _ensure_transporter_profile(principal: Principal) -> None:
+    tid = str(principal["id"])
+    existing = db.one("select profile_id from transporter_profiles where profile_id = ?", (tid,))
+    if not existing:
+        db.insert(
+            "transporter_profiles",
+            {
+                "profile_id": tid,
+                "company_name": str(principal.get("full_name") or "Transporter"),
+                "fleet_size": 0,
+                "verification_status": "pending",
+                "rating": 0,
+                "created_at": NOW(),
+            },
+        )
+
+
 # --------------------------------------------------------------------------- #
 # vehicles
 # --------------------------------------------------------------------------- #
 @router.get("/vehicles")
-def list_vehicles(principal: Principal = Depends(any_role),
-                  transporter_id: str | None = Query(None),
-                  status: str | None = Query(None)):
-    sql = "select v.*, p.full_name as transporter_name from vehicles v join profiles p on p.id = v.transporter_id where 1=1"
+def list_vehicles(
+    principal: Principal = Depends(any_role),
+    transporter_id: str | None = Query(None),
+    status: str | None = Query(None),
+):
+    sql = (
+        "select v.*, p.full_name as transporter_name "
+        "from vehicles v join profiles p on p.id = v.transporter_id where 1=1"
+    )
     params: list = []
     if principal["role"] == "transporter":
         sql += " and v.transporter_id = ?"
-        params.append(principal["id"])
+        params.append(str(principal["id"]))
     elif transporter_id:
         sql += " and v.transporter_id = ?"
-        params.append(transporter_id)
+        params.append(str(transporter_id))
     if status and status != "all":
         sql += " and v.availability = ?"
         params.append(status)
@@ -65,30 +87,69 @@ def list_vehicles(principal: Principal = Depends(any_role),
 def add_vehicle(body: VehicleIn, principal: Principal = Depends(transporter_only)):
     if body.vehicle_class not in CLASSES:
         raise HTTPException(400, f"vehicle_class must be one of {CLASSES}")
-    if db.one("select id from vehicles where reg_no = ?", (body.reg_no.upper(),)):
+    reg_clean = body.reg_no.strip().upper()
+    if db.one("select id from vehicles where upper(reg_no) = ?", (reg_clean,)):
         raise HTTPException(409, "A vehicle with this registration already exists")
+
+    tid = str(principal["id"])
+    _ensure_transporter_profile(principal)
+
     vid = uid("VEH")
-    db.insert("vehicles", {
-        "id": vid, "transporter_id": principal["id"], "reg_no": body.reg_no.upper(),
-        "vehicle_class": body.vehicle_class, "payload_kg": body.payload_kg,
-        "volume_m3": body.volume_m3, "body_type": body.body_type, "fuel": body.fuel,
-        "operating_districts": body.operating_districts, "availability": body.availability,
-        "cost_per_km": body.cost_per_km, "verified": False, "created_at": NOW(),
-    })
-    db.insert("vehicle_documents", {"id": uid("DOC"), "vehicle_id": vid, "doc_type": "rc",
-                                    "doc_ref": f"storage://vehicle-docs/{vid}-rc.pdf",
-                                    "verified": False, "uploaded_at": NOW()})
-    db.execute("update transporter_profiles set fleet_size = fleet_size + 1 where profile_id = ?", (principal["id"],))
-    audit(principal, "vehicle.create", entity_type="vehicle", entity_id=vid)
+    created_v = db.insert(
+        "vehicles",
+        {
+            "id": vid,
+            "transporter_id": tid,
+            "reg_no": reg_clean,
+            "vehicle_class": body.vehicle_class,
+            "payload_kg": body.payload_kg,
+            "volume_m3": body.volume_m3,
+            "body_type": body.body_type,
+            "fuel": body.fuel,
+            "operating_districts": body.operating_districts,
+            "availability": body.availability,
+            "cost_per_km": body.cost_per_km,
+            "verified": False,
+            "created_at": NOW(),
+        },
+    )
+    actual_vid = str(created_v.get("id") or vid)
+
+    db.insert(
+        "vehicle_documents",
+        {
+            "id": uid("DOC"),
+            "vehicle_id": actual_vid,
+            "doc_type": "rc",
+            "doc_ref": f"storage://vehicle-docs/{actual_vid}-rc.pdf",
+            "verified": False,
+            "uploaded_at": NOW(),
+        },
+    )
+    db.execute(
+        "update transporter_profiles set fleet_size = coalesce(fleet_size, 0) + 1 where profile_id = ?",
+        (tid,),
+    )
+    audit(principal, "vehicle.create", entity_type="vehicle", entity_id=actual_vid)
     for admin in db.q("select id from profiles where role = 'admin'"):
-        notify(admin["id"], f"Vehicle {body.reg_no.upper()} submitted", "Documents await verification.", "action", "/admin/vehicles")
-    return {"id": vid, "message": "Vehicle added. Admin verification is pending before assignments unlock."}
+        notify(
+            str(admin["id"]),
+            f"Vehicle {reg_clean} submitted",
+            "Documents await verification.",
+            "action",
+            "/admin/vehicles",
+        )
+    return {
+        "id": actual_vid,
+        "message": "Vehicle added. Admin verification is pending before assignments unlock.",
+    }
 
 
 @router.patch("/vehicles/{vehicle_id}")
 def update_vehicle(vehicle_id: str, body: dict, principal: Principal = Depends(transporter_only)):
+    tid = str(principal["id"])
     v = db.one("select * from vehicles where id = ?", (vehicle_id,))
-    if not v or v["transporter_id"] != principal["id"]:
+    if not v or str(v["transporter_id"]) != tid:
         raise HTTPException(404, "Vehicle not found for this account")
     allowed = {k: body[k] for k in ("availability", "cost_per_km", "operating_districts") if k in body}
     if not allowed:
@@ -105,13 +166,19 @@ def verify_vehicle(vehicle_id: str, payload: dict, principal: Principal = Depend
     if not v:
         raise HTTPException(404, "Vehicle not found")
     ok = bool(payload.get("verified"))
-    db.execute("update vehicles set verified = ?, verified_at = ? where id = ?",
-               (ok, NOW() if ok else None, vehicle_id))
+    db.execute(
+        "update vehicles set verified = ?, verified_at = ? where id = ?",
+        (ok, NOW() if ok else None, vehicle_id),
+    )
     db.execute("update vehicle_documents set verified = ? where vehicle_id = ?", (ok, vehicle_id))
     audit(principal, "vehicle.verify", entity_type="vehicle", entity_id=vehicle_id, after={"verified": ok})
-    notify(v["transporter_id"], f"Vehicle {v['reg_no']} {'verified' if ok else 'rejected by Admin'}",
-           "Assignments are now unlocked." if ok else "Re-upload documents and resubmit.",
-           "success" if ok else "warning", "/transporter/vehicles")
+    notify(
+        str(v["transporter_id"]),
+        f"Vehicle {v['reg_no']} {'verified' if ok else 'rejected by Admin'}",
+        "Assignments are now unlocked." if ok else "Re-upload documents and resubmit.",
+        "success" if ok else "warning",
+        "/transporter/vehicles",
+    )
     return {"verified": ok}
 
 
@@ -119,9 +186,11 @@ def verify_vehicle(vehicle_id: str, payload: dict, principal: Principal = Depend
 # capacity blocks
 # --------------------------------------------------------------------------- #
 @router.get("/capacity")
-def list_capacity(principal: Principal = Depends(any_role),
-                  status: str | None = Query(None),
-                  vehicle_class: str | None = Query(None)):
+def list_capacity(
+    principal: Principal = Depends(any_role),
+    status: str | None = Query(None),
+    vehicle_class: str | None = Query(None),
+):
     sql = """select cb.*, v.reg_no, p.full_name as transporter_name,
                     tp.verification_status
              from capacity_blocks cb
@@ -132,7 +201,7 @@ def list_capacity(principal: Principal = Depends(any_role),
     params: list = []
     if principal["role"] == "transporter":
         sql += " and cb.transporter_id = ?"
-        params.append(principal["id"])
+        params.append(str(principal["id"]))
     if status and status != "all":
         sql += " and cb.status = ?"
         params.append(status)
@@ -155,7 +224,8 @@ def list_capacity(principal: Principal = Depends(any_role),
 
 @router.post("/capacity")
 def publish_capacity(body: CapacityIn, principal: Principal = Depends(transporter_only)):
-    v = db.one("select * from vehicles where id = ? and transporter_id = ?", (body.vehicle_id, principal["id"]))
+    tid = str(principal["id"])
+    v = db.one("select * from vehicles where id = ? and transporter_id = ?", (body.vehicle_id, tid))
     if not v:
         raise HTTPException(404, "Vehicle not found for this account")
     if not v["verified"]:
@@ -163,24 +233,43 @@ def publish_capacity(body: CapacityIn, principal: Principal = Depends(transporte
     if body.payload_kg > v["payload_kg"]:
         raise HTTPException(400, f"Block size cannot exceed vehicle payload ({v['payload_kg']} kg)")
     cid = uid("CAP")
-    db.insert("capacity_blocks", {
-        "id": cid, "transporter_id": principal["id"], "vehicle_id": body.vehicle_id,
-        "vehicle_class": body.vehicle_class, "payload_kg": body.payload_kg, "volume_m3": body.volume_m3,
-        "corridor": body.corridor, "window_from": body.window_from, "window_to": body.window_to,
-        "block_size_kg": body.block_size_kg, "min_run_km": body.min_run_km,
-        "reserve_price_per_km": body.reserve_price_per_km, "cancellation_terms": body.cancellation_terms,
-        "status": "published", "created_at": NOW(),
-    })
-    audit(principal, "capacity.publish", entity_type="capacity_block", entity_id=cid)
+    created_c = db.insert(
+        "capacity_blocks",
+        {
+            "id": cid,
+            "transporter_id": tid,
+            "vehicle_id": str(v["id"]),
+            "vehicle_class": body.vehicle_class,
+            "payload_kg": body.payload_kg,
+            "volume_m3": body.volume_m3,
+            "corridor": body.corridor,
+            "window_from": body.window_from,
+            "window_to": body.window_to,
+            "block_size_kg": body.block_size_kg,
+            "min_run_km": body.min_run_km,
+            "reserve_price_per_km": body.reserve_price_per_km,
+            "cancellation_terms": body.cancellation_terms,
+            "status": "published",
+            "created_at": NOW(),
+        },
+    )
+    actual_cid = str(created_c.get("id") or cid)
+    audit(principal, "capacity.publish", entity_type="capacity_block", entity_id=actual_cid)
     for admin in db.q("select id from profiles where role = 'admin'"):
-        notify(admin["id"], f"Capacity published · {body.vehicle_class}",
-               f"{body.block_size_kg:,} kg on {body.corridor}", "info", "/admin/capacity")
-    return {"id": cid, "message": "Capacity block published to the Options Exchange."}
+        notify(
+            str(admin["id"]),
+            f"Capacity published · {body.vehicle_class}",
+            f"{body.block_size_kg:,} kg on {body.corridor}",
+            "info",
+            "/admin/capacity",
+        )
+    return {"id": actual_cid, "message": "Capacity block published to the Options Exchange."}
 
 
 @router.post("/capacity/{block_id}/withdraw")
 def withdraw_capacity(block_id: str, principal: Principal = Depends(transporter_only)):
-    b = db.one("select * from capacity_blocks where id = ? and transporter_id = ?", (block_id, principal["id"]))
+    tid = str(principal["id"])
+    b = db.one("select * from capacity_blocks where id = ? and transporter_id = ?", (block_id, tid))
     if not b:
         raise HTTPException(404, "Capacity block not found")
     if b["status"] == "reserved":
@@ -195,14 +284,16 @@ def withdraw_capacity(block_id: str, principal: Principal = Depends(transporter_
 # --------------------------------------------------------------------------- #
 @router.get("/transporters")
 def list_transporters(principal: Principal = Depends(admin_only)):
-    rows = db.q("""select p.id, p.full_name, p.email, p.mobile, p.status, p.created_at,
-                          tp.company_name, tp.fleet_size, tp.verification_status, tp.rating,
-                          (select count(*) from vehicles v where v.transporter_id = p.id) as vehicles,
-                          (select count(*) from vehicles v where v.transporter_id = p.id and v.verified IS TRUE) as verified_vehicles,
-                          (select count(*) from transport_assignments ta where ta.transporter_id = p.id) as assignments,
-                          (select count(*) from transport_assignments ta where ta.transporter_id = p.id and ta.status = 'confirmed') as confirmed
-                   from profiles p left join transporter_profiles tp on tp.profile_id = p.id
-                   where p.role = 'transporter' order by p.created_at desc""")
+    rows = db.q(
+        """select p.id, p.full_name, p.email, p.mobile, p.status, p.created_at,
+                  tp.company_name, tp.fleet_size, tp.verification_status, tp.rating,
+                  (select count(*) from vehicles v where v.transporter_id = p.id) as vehicles,
+                  (select count(*) from vehicles v where v.transporter_id = p.id and v.verified IS TRUE) as verified_vehicles,
+                  (select count(*) from transport_assignments ta where ta.transporter_id = p.id) as assignments,
+                  (select count(*) from transport_assignments ta where ta.transporter_id = p.id and ta.status = 'confirmed') as confirmed
+           from profiles p left join transporter_profiles tp on tp.profile_id = p.id
+           where p.role = 'transporter' order by p.created_at desc"""
+    )
     return {"items": rows, "total": len(rows)}
 
 
@@ -212,29 +303,35 @@ def verify_transporter(transporter_id: str, payload: dict, principal: Principal 
     tp = db.one("select * from transporter_profiles where profile_id = ?", (transporter_id,))
     if not tp:
         raise HTTPException(404, "Transporter not found")
-    db.execute("update transporter_profiles set verification_status = ? where profile_id = ?",
-               ("verified" if ok else "rejected", transporter_id))
+    db.execute(
+        "update transporter_profiles set verification_status = ? where profile_id = ?",
+        ("verified" if ok else "rejected", transporter_id),
+    )
     audit(principal, "transporter.verify", entity_type="profile", entity_id=transporter_id, after={"verified": ok})
-    notify(transporter_id, "Account verification updated",
-           "Your account is verified." if ok else "Verification rejected — contact support.", "success" if ok else "warning")
+    notify(
+        transporter_id,
+        "Account verification updated",
+        "Your account is verified." if ok else "Verification rejected — contact support.",
+        "success" if ok else "warning",
+    )
     return {"verification_status": "verified" if ok else "rejected"}
 
 
 @router.get("/transporters/me/performance")
 def my_performance(principal: Principal = Depends(transporter_only)):
-    doer = f"%{principal['id']}%"
+    tid = str(principal["id"])
     rows = db.q(
         """select t.*, ta.revenue, ta.distance_km, ta.vehicle_id, v.vehicle_class
            from trips t join transport_assignments ta on ta.id = t.assignment_id
            left join vehicles v on v.id = ta.vehicle_id
            where ta.transporter_id = ? order by t.created_at desc""",
-        (principal["id"],),
+        (tid,),
     )
     done = [r for r in rows if r["status"] == "delivered"]
     active = [r for r in rows if r["status"] in ("loading", "in_transit", "at_hub", "out_for_delivery")]
     revenue = sum(float(r["revenue"] or 0) for r in done)
     km = sum(float(r["distance_km"] or 0) for r in done)
-    vehicles = db.q("select * from vehicles where transporter_id = ?", (principal["id"],))
+    vehicles = db.q("select * from vehicles where transporter_id = ?", (tid,))
     return {
         "trips_total": len(rows),
         "trips_completed": len(done),
