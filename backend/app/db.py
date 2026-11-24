@@ -14,8 +14,10 @@ a driver directly.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
+import uuid
 from typing import Any, Iterable, Sequence
 
 from .core.config import settings
@@ -23,6 +25,10 @@ from .core.config import settings
 _lock = threading.RLock()
 _state: dict[str, Any] = {"conn": None, "dialect": "sqlite"}
 _col_cache: dict[tuple[str, str], set[str]] = {}
+_uuid_col_cache: dict[tuple[str, str], set[str]] = {}
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -82,21 +88,48 @@ def _table_columns(table: str) -> set[str] | None:
         return _col_cache[key]
     if d == "postgres":
         rows = q(
-            "select column_name from information_schema.columns "
+            "select column_name, data_type from information_schema.columns "
             "where table_schema = 'public' and table_name = ?",
             (table,),
         )
         cols = {r["column_name"] for r in rows}
+        uuid_cols = {
+            r["column_name"]
+            for r in rows
+            if (r.get("data_type") or "").lower() == "uuid"
+        }
         if cols:
             _col_cache[key] = cols
+            _uuid_col_cache[key] = uuid_cols
             return cols
         return None
     rows = q(f"pragma table_info({table})")
     cols = {r["name"] for r in rows if "name" in r}
     if cols:
         _col_cache[key] = cols
+        _uuid_col_cache[key] = set()
         return cols
     return None
+
+
+def _uuid_columns(table: str) -> set[str]:
+    _table_columns(table)
+    return _uuid_col_cache.get((_state["dialect"], table), set())
+
+
+def _coerce_uuid_value(val: Any) -> str:
+    if isinstance(val, uuid.UUID):
+        return str(val)
+    if isinstance(val, str) and _UUID_RE.match(val.strip()):
+        return val.strip()
+    return str(uuid.uuid4())
+
+
+def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in row.items():
+        out[k] = str(v) if isinstance(v, uuid.UUID) else v
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -105,8 +138,7 @@ def _table_columns(table: str) -> set[str] | None:
 def _rows(cur) -> list[dict]:
     out: list[dict] = []
     for r in cur.fetchall():
-        d = dict(r)
-        out.append(d)
+        out.append(_normalize_row(dict(r)))
     return out
 
 
@@ -165,12 +197,17 @@ def insert(table: str, data: dict) -> dict:
     filtered = {k: v for k, v in data.items() if not known_cols or k in known_cols}
     if not filtered:
         filtered = dict(data)
+    if _state["dialect"] == "postgres":
+        uuid_cols = _uuid_columns(table)
+        for col in uuid_cols:
+            if col in filtered and filtered[col] is not None:
+                filtered[col] = _coerce_uuid_value(filtered[col])
     cols = list(filtered.keys())
     ph = ", ".join("?" for _ in cols)
     query = f"insert into {table} ({', '.join(cols)}) values ({ph})"
     if _state["dialect"] == "postgres":
         rows = q(query + " returning *", [filtered[c] for c in cols])
-        return rows[0] if rows else filtered
+        return rows[0] if rows else _normalize_row(filtered)
     execute(query, [filtered[c] for c in cols])
     return filtered
 
