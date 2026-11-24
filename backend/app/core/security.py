@@ -61,8 +61,8 @@ def create_token(sub: str, role: str, ttl_hours: int | None = None) -> str:
     ttl = ttl_hours or settings.TOKEN_TTL_HOURS
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
-        "sub": sub,
-        "role": role,
+        "sub": str(sub),
+        "role": str(role),
         "iss": "cargox-api",
         "iat": int(time.time()),
         "exp": int(time.time() + ttl * 3600),
@@ -113,7 +113,6 @@ def _google_keys(force: bool = False) -> dict:
         _JWKS_CACHE["fetched"] = time.time()
         return keys
     except Exception:
-        # network unavailable: remember nothing, so the next sign-in retries
         return _JWKS_CACHE["keys"] or {}  # type: ignore[return-value]
 
 
@@ -125,7 +124,6 @@ def _rs256_verify(signing_input: bytes, signature: bytes, n_b64: str, e_b64: str
     if len(signature) != k:
         return False
     m = pow(int.from_bytes(signature, "big"), e, n).to_bytes(k, "big")
-    # DigestInfo prefix for SHA-256
     digest_info = bytes.fromhex("3031300d060960864801650304020105000420")
     digest = hashlib.sha256(signing_input).digest()
     expected = b"\x00\x01" + b"\xff" * (k - len(digest_info) - len(digest) - 3) + b"\x00" + digest_info + digest
@@ -183,32 +181,38 @@ class Principal(dict):
 
     @property
     def id(self) -> str:  # type: ignore[override]
-        return self["id"]
+        return str(self["id"])
 
     @property
     def role(self) -> str:
-        return self["role"]
+        return str(self["role"])
 
 
 def get_principal(request: Request) -> Principal:
-    # local import avoids a circular import at module load
     from ..db import one
 
     token = _bearer(request)
     if not token:
         raise HTTPException(status_code=401, detail="Missing bearer token")
     claims = decode_token(token)
-    if not claims:
+    if not claims or not claims.get("sub"):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     row = one(
         "select id, role, email, full_name, status from profiles where id = ?",
-        (claims["sub"],),
+        (str(claims["sub"]),),
     )
     if not row:
         raise HTTPException(status_code=401, detail="Account not found")
     if row["status"] != "active":
         raise HTTPException(status_code=403, detail="Account is suspended")
-    return Principal(**row)
+    normalized = {
+        "id": str(row["id"]),
+        "role": str(row["role"]),
+        "email": row["email"],
+        "full_name": row["full_name"],
+        "status": row["status"],
+    }
+    return Principal(**normalized)
 
 
 def require_roles(*roles: str):
