@@ -20,7 +20,7 @@ class VehicleIn(BaseModel):
     volume_m3: float = Field(gt=0)
     body_type: str = "open"
     fuel: str = "diesel"
-    operating_districts: str = "Ludhiana"
+    operating_districts: str | list[str] = "Ludhiana"
     cost_per_km: float = 22.0
     availability: str = "available"
 
@@ -52,10 +52,38 @@ def _str_id(val: object) -> str:
     return "" if val is None else str(val)
 
 
+def _normalize_districts(val: object) -> list[str]:
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    if isinstance(val, str):
+        parts = [p.strip() for p in val.split(",") if p.strip()]
+        return parts or ["Ludhiana"]
+    return ["Ludhiana"]
+
+
 def _safe_insert(table: str, payload: dict) -> dict | None:
     try:
         return db.insert(table, payload)
     except Exception:
+        # Retry once converting string values into single-element lists for Postgres array columns
+        array_adapted = {
+            k: ([v] if isinstance(v, str) and k not in ("id", "reg_no", "vehicle_class", "body_type", "fuel", "availability") else v)
+            for k, v in payload.items()
+        }
+        try:
+            return db.insert(table, array_adapted)
+        except Exception:
+            pass
+
+        # Also try wrapping operating_districts specifically as a list
+        districts_adapted = dict(payload)
+        if "operating_districts" in districts_adapted and isinstance(districts_adapted["operating_districts"], str):
+            districts_adapted["operating_districts"] = _normalize_districts(districts_adapted["operating_districts"])
+            try:
+                return db.insert(table, districts_adapted)
+            except Exception:
+                pass
+
         current = dict(payload)
         while len(current) > 1:
             current.pop(next(reversed(current)))
@@ -126,6 +154,8 @@ def list_vehicles(
         r["id"] = _str_id(r.get("id"))
         r["transporter_id"] = _str_id(r.get("transporter_id"))
         r["verified"] = bool(r.get("verified"))
+        if isinstance(r.get("operating_districts"), list):
+            r["operating_districts"] = ", ".join(str(x) for x in r["operating_districts"])
     return {"items": rows, "vehicle_classes": CLASSES}
 
 
@@ -140,28 +170,43 @@ def add_vehicle(body: VehicleIn, principal: Principal = Depends(transporter_only
     tid = _str_id(principal.get("id"))
     _ensure_transporter_profile(principal)
 
-    vid = uid("VEH")
-    created_v = _safe_insert(
-        "vehicles",
-        {
-            "id": vid,
-            "transporter_id": tid,
-            "reg_no": reg_clean,
-            "vehicle_class": body.vehicle_class,
-            "payload_kg": body.payload_kg,
-            "volume_m3": body.volume_m3,
-            "body_type": body.body_type,
-            "fuel": body.fuel,
-            "operating_districts": body.operating_districts,
-            "availability": body.availability,
-            "cost_per_km": body.cost_per_km,
-            "verified": False,
-            "created_at": NOW(),
-        },
+    districts_val: str | list[str] = (
+        _normalize_districts(body.operating_districts)
+        if _is_postgres()
+        else ", ".join(_normalize_districts(body.operating_districts))
     )
-    if not created_v and not db.one("select id from vehicles where id = ?", (vid,)):
+
+    vid = uid("VEH")
+    payload = {
+        "id": vid,
+        "transporter_id": tid,
+        "reg_no": reg_clean,
+        "vehicle_class": body.vehicle_class,
+        "payload_kg": body.payload_kg,
+        "volume_m3": body.volume_m3,
+        "body_type": body.body_type,
+        "fuel": body.fuel,
+        "operating_districts": districts_val,
+        "availability": body.availability,
+        "cost_per_km": body.cost_per_km,
+        "verified": False,
+        "created_at": NOW(),
+    }
+
+    try:
+        created_v = db.insert("vehicles", payload)
+    except Exception:
+        alt_payload = dict(payload)
+        if isinstance(districts_val, list):
+            alt_payload["operating_districts"] = ", ".join(districts_val)
+        else:
+            alt_payload["operating_districts"] = _normalize_districts(districts_val)
+        created_v = _safe_insert("vehicles", alt_payload)
+
+    saved_row = created_v or db.one("select * from vehicles where id = ?", (vid,))
+    if not saved_row:
         raise HTTPException(500, "Could not save vehicle record to database")
-    actual_vid = _str_id((created_v or {}).get("id")) or vid
+    actual_vid = _str_id(saved_row.get("id")) or vid
 
     try:
         _safe_insert(
@@ -186,17 +231,26 @@ def add_vehicle(body: VehicleIn, principal: Principal = Depends(transporter_only
     except Exception:
         pass
 
-    audit(principal, "vehicle.create", entity_type="vehicle", entity_id=actual_vid)
-    for admin in db.q("select id from profiles where role = 'admin'"):
-        notify(
-            _str_id(admin.get("id")),
-            f"Vehicle {reg_clean} submitted",
-            "Documents await verification.",
-            "action",
-            "/admin/vehicles",
-        )
+    try:
+        audit(principal, "vehicle.create", entity_type="vehicle", entity_id=actual_vid)
+    except Exception:
+        pass
+
+    try:
+        for admin in db.q("select id from profiles where role = 'admin'"):
+            notify(
+                _str_id(admin.get("id")),
+                f"Vehicle {reg_clean} submitted",
+                "Documents await verification.",
+                "action",
+                "/admin/vehicles",
+            )
+    except Exception:
+        pass
+
     return {
         "id": actual_vid,
+        "verified": bool(saved_row.get("verified", False)),
         "message": "Vehicle added. Admin verification is pending before assignments unlock.",
     }
 
@@ -208,7 +262,13 @@ def update_vehicle(vehicle_id: str, body: dict, principal: Principal = Depends(t
     v = db.one("select * from vehicles where id = ?", (vid,))
     if not v or _str_id(v.get("transporter_id")) != tid:
         raise HTTPException(404, "Vehicle not found for this account")
-    allowed = {k: body[k] for k in ("availability", "cost_per_km", "operating_districts") if k in body}
+    allowed = {}
+    for k in ("availability", "cost_per_km", "operating_districts"):
+        if k in body:
+            if k == "operating_districts" and _is_postgres():
+                allowed[k] = _normalize_districts(body[k])
+            else:
+                allowed[k] = body[k]
     if not allowed:
         raise HTTPException(400, "Nothing to update")
     sets = ", ".join(f"{k} = ?" for k in allowed)
