@@ -1,66 +1,111 @@
 """GramTwin-2E planning + routing.
 
-* `plan_routes`      -> CVRPTW over a real stop set using Google OR-Tools, with a
+- `plan_routes`      -> CVRPTW over a real stop set using Google OR-Tools, with a
                         greedy nearest-vehicle fallback so the API never fails.
-* `select_hubs`      -> constrained facility location (k-median style) over the
+- `select_hubs`      -> constrained facility location (k-median style) over the
                         village road graph, honouring safety / access / window.
-* `build_two_echelon`-> first-mile collection by small vehicle to a hub, then
+- `build_two_echelon`-> first-mile collection by small vehicle to a hub, then
                         line-haul by a larger vehicle, synchronised on a transfer
                         window.  Falls back to direct trips when no hub qualifies.
 """
 from __future__ import annotations
 
-import math
 import time
+from typing import Any
 
 from .geo import (
     CLASS_CAPACITY_KG,
-    CLASS_SPEED_KMPH,
     allowed_classes,
     road_km,
     travel_minutes,
 )
 
 
+def _coords(row: dict[str, Any] | None) -> tuple[float, float] | None:
+    if not row:
+        return None
+    lat = row.get("lat")
+    lng = row.get("lng")
+    if lat is None or lng is None:
+        return None
+    try:
+        return float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None
+
+
+def _valid_stops(stops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for idx, s in enumerate(stops or []):
+        c = _coords(s)
+        if c is None:
+            continue
+        out.append({
+            **s,
+            "id": s.get("id") or f"STOP-{idx + 1}",
+            "name": s.get("name") or f"Stop {idx + 1}",
+            "lat": c[0],
+            "lng": c[1],
+        })
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # hub selection
 # --------------------------------------------------------------------------- #
 def select_hubs(villages: list[dict], candidates: list[dict], k: int = 2, radius_km: float = 14.0) -> dict:
+    valid_villages = [
+        {**v, "id": v.get("id") or f"VIL-{i + 1}", "name": v.get("name") or f"Village {i + 1}",
+         "lat": _coords(v)[0], "lng": _coords(v)[1]}
+        for i, v in enumerate(villages or [])
+        if _coords(v) is not None
+    ]
     usable = [
-        c for c in candidates
-        if c.get("safety_verified") and c.get("operating_window")
+        {**c, "id": c.get("id") or f"HUB-{i + 1}", "name": c.get("name") or f"Hub {i + 1}",
+         "lat": _coords(c)[0], "lng": _coords(c)[1]}
+        for i, c in enumerate(candidates or [])
+        if c.get("safety_verified") and c.get("operating_window") and _coords(c) is not None
     ]
     if not usable:
-        return {"hubs": [], "coverage": 0.0, "note": "No safety-verified candidate hubs — direct trips required."}
+        return {"hubs": [], "assignments": [], "coverage": 0.0,
+                "note": "No safety-verified candidate hubs — direct trips required."}
+    if not valid_villages:
+        return {"hubs": usable[:k], "assignments": [], "coverage": 0.0,
+                "radius_km": radius_km, "objective": 0.0, "method": "constrained_k_median"}
 
     def cost_of(hub: dict) -> tuple[float, float]:
-        dists = [road_km(v["lat"], v["lng"], hub["lat"], hub["lng"]) for v in villages]
+        dists = [road_km(v["lat"], v["lng"], hub["lat"], hub["lng"]) for v in valid_villages]
         served = [d for d in dists if d <= radius_km]
         total = sum(served)
-        coverage = len(served) / max(len(villages), 1)
-        # penalise uncovered villages heavily (k-median with coverage constraint)
-        score = total + (len(villages) - len(served)) * radius_km * 3
+        coverage = len(served) / max(len(valid_villages), 1)
+        score = total + (len(valid_villages) - len(served)) * radius_km * 3
         return round(score, 2), coverage
 
     scored = []
     for c in usable:
         s, cov = cost_of(c)
-        scored.append({**c, "objective": s, "coverage": round(cov, 3), "avg_km": round(s / max(len(villages), 1), 2)})
+        scored.append({**c, "objective": s, "coverage": round(cov, 3),
+                       "avg_km": round(s / max(len(valid_villages), 1), 2)})
     scored.sort(key=lambda x: x["objective"])
-    chosen = scored[:k]
+    chosen = scored[:max(1, k)]
 
-    # assign each village to its nearest chosen hub
     assignments = []
-    for v in villages:
+    for v in valid_villages:
         best = min(chosen, key=lambda h: road_km(v["lat"], v["lng"], h["lat"], h["lng"]))
         d = road_km(v["lat"], v["lng"], best["lat"], best["lng"])
-        assignments.append({"village_id": v["id"], "village": v["name"], "hub_id": best["id"], "hub": best["name"], "distance_km": d})
+        assignments.append({
+            "village_id": v["id"],
+            "village": v["name"],
+            "hub_id": best["id"],
+            "hub": best["name"],
+            "distance_km": d,
+        })
 
     covered = sum(1 for a in assignments if a["distance_km"] <= radius_km)
     return {
         "hubs": chosen,
         "assignments": assignments,
-        "coverage": round(covered / max(len(villages), 1), 3),
+        "coverage": round(covered / max(len(valid_villages), 1), 3),
         "radius_km": radius_km,
         "objective": round(sum(h["objective"] for h in chosen), 2),
         "method": "constrained_k_median",
@@ -77,13 +122,17 @@ def _matrix(points: list[tuple[float, float]]) -> list[list[float]]:
 def plan_routes(
     *,
     depot: tuple[float, float],
-    stops: list[dict],            # [{id, name, lat, lng, demand_kg, ready_min, deadline_min}]
-    vehicles: list[dict],         # [{id, class, capacity_kg, cost_per_km}]
+    stops: list[dict],
+    vehicles: list[dict],
     horizon_min: int = 600,
     service_min: int = 15,
 ) -> dict:
     """Solve CVRPTW with OR-Tools; fall back to greedy insertion."""
-    if not stops:
+    clean_stops = _valid_stops(stops)
+    safe_vehicles = vehicles or [{"id": "VEH-DEFAULT", "class": "lcv", "capacity_kg": 7500, "cost_per_km": 32}]
+    depot_pt = (float(depot[0]), float(depot[1]))
+
+    if not clean_stops:
         return {"routes": [], "unassigned": [], "solver": "trivial", "solve_ms": 0,
                 "total_km": 0.0, "total_cost": 0.0, "load_factor": 0.0}
 
@@ -91,12 +140,11 @@ def plan_routes(
     try:
         from ortools.constraint_solver import pywrapcp, routing_enums_pb2  # type: ignore
 
-        points = [depot] + [(s["lat"], s["lng"]) for s in stops]
+        points = [depot_pt] + [(s["lat"], s["lng"]) for s in clean_stops]
         dist = _matrix(points)
-        # scale to integer metres as OR-Tools needs integers
         d_int = [[int(round(x * 1000)) for x in row] for row in dist]
-        n_v = max(1, len(vehicles))
-        caps = [int(v["capacity_kg"]) for v in vehicles] or [16000] * n_v
+        n_v = max(1, len(safe_vehicles))
+        caps = [max(1, int(float(v.get("capacity_kg") or 16000))) for v in safe_vehicles]
 
         manager = pywrapcp.RoutingIndexManager(len(points), n_v, 0)
         routing = pywrapcp.RoutingModel(manager)
@@ -107,7 +155,7 @@ def plan_routes(
         cb = routing.RegisterTransitCallback(dist_cb)
         routing.SetArcCostEvaluatorOfAllVehicles(cb)
 
-        demands = [0] + [int(s.get("demand_kg") or 0) for s in stops]
+        demands = [0] + [max(0, int(float(s.get("demand_kg") or 0))) for s in clean_stops]
 
         def demand_cb(fi):
             return demands[manager.IndexToNode(fi)]
@@ -115,16 +163,17 @@ def plan_routes(
         dcb = routing.RegisterUnaryTransitCallback(demand_cb)
         routing.AddDimensionWithVehicleCapacity(dcb, 0, caps, True, "Capacity")
 
-        # time dimension: depot at minute 0, service time per stop
+        v0_class = safe_vehicles[0].get("class") or "lcv"
+
         def time_cb(fi, ti):
             a, b = manager.IndexToNode(fi), manager.IndexToNode(ti)
-            mins = travel_minutes(vehicles[0]["class"], dist[a][b] / 1000) if a != b else 0
-            return int(mins)
+            mins = travel_minutes(v0_class, dist[a][b] / 1000) if a != b else 0
+            return int(mins) + (service_min if b != 0 else 0)
 
         tcb = routing.RegisterTransitCallback(time_cb)
         routing.AddDimension(tcb, 60, horizon_min, False, "Time")
         tdim = routing.GetDimensionOrDie("Time")
-        for i, s in enumerate(stops, start=1):
+        for i, s in enumerate(clean_stops, start=1):
             idx = manager.NodeToIndex(i)
             rdy = int(s.get("ready_min") or 0)
             ddl = int(min(s.get("deadline_min") or horizon_min, horizon_min))
@@ -149,40 +198,50 @@ def plan_routes(
                     node = manager.IndexToNode(idx)
                     if node != 0:
                         seq.append(node)
-                        load += stops[node - 1].get("demand_kg") or 0
-                        assigned.add(stops[node - 1]["id"])
+                        load += float(clean_stops[node - 1].get("demand_kg") or 0)
+                        assigned.add(clean_stops[node - 1]["id"])
                     nxt = sol.Value(routing.NextVar(idx))
                     nnode = manager.IndexToNode(nxt)
                     km += d_int[node][nnode] / 1000
                     idx = nxt
                 if seq:
-                    routes.append(_materialise(v, seq, stops, vehicles, km, load, depot))
-            unassigned = [s for s in stops if s["id"] not in assigned]
+                    routes.append(_materialise(v, seq, clean_stops, safe_vehicles, km, load, depot_pt, service_min))
+            unassigned = [s for s in clean_stops if s["id"] not in assigned]
             solve_ms = int((time.perf_counter() - started) * 1000)
             return _summarise(routes, unassigned, "ortools_guided_local_search", solve_ms)
     except Exception as exc:  # pragma: no cover - OR-Tools unavailable/edge case
         solve_ms = int((time.perf_counter() - started) * 1000)
-        greedy = greedy_routes(depot=depot, stops=stops, vehicles=vehicles)
+        greedy = greedy_routes(depot=depot_pt, stops=clean_stops, vehicles=safe_vehicles, service_min=service_min)
         greedy["solver"] = f"greedy_insertion_fallback ({type(exc).__name__})"
         greedy["solve_ms"] = solve_ms
         return greedy
 
-    greedy = greedy_routes(depot=depot, stops=stops, vehicles=vehicles)
+    greedy = greedy_routes(depot=depot_pt, stops=clean_stops, vehicles=safe_vehicles, service_min=service_min)
     greedy["solve_ms"] = int((time.perf_counter() - started) * 1000)
     return greedy
 
 
-def _materialise(v_idx: int, seq: list[int], stops, vehicles, km, load, depot) -> dict:
+def _materialise(
+    v_idx: int,
+    seq: list[int],
+    stops: list[dict],
+    vehicles: list[dict],
+    km: float,
+    load: float,
+    depot: tuple[float, float],
+    service_min: int = 15,
+) -> dict:
     v = vehicles[v_idx] if v_idx < len(vehicles) else vehicles[-1]
+    v_class = v.get("class") or "lcv"
     pts = [depot] + [(stops[n - 1]["lat"], stops[n - 1]["lng"]) for n in seq]
     eta, t = [], 0
     for a, b in zip(pts, pts[1:]):
-        t += travel_minutes(v["class"], road_km(a[0], a[1], b[0], b[1])) + 15
+        t += travel_minutes(v_class, road_km(a[0], a[1], b[0], b[1])) + service_min
         eta.append(t)
-    cap = float(v["capacity_kg"]) or 1
+    cap = float(v.get("capacity_kg") or 1) or 1.0
     return {
-        "vehicle_id": v["id"],
-        "vehicle_class": v["class"],
+        "vehicle_id": v.get("id") or f"VEH-{v_idx + 1}",
+        "vehicle_class": v_class,
         "stops": [
             {**{k: stops[n - 1][k] for k in ("id", "name") if k in stops[n - 1]},
              "lat": stops[n - 1]["lat"], "lng": stops[n - 1]["lng"],
@@ -214,41 +273,48 @@ def _summarise(routes, unassigned, solver, solve_ms) -> dict:
     }
 
 
-def greedy_routes(*, depot, stops, vehicles) -> dict:
+def greedy_routes(*, depot, stops, vehicles, service_min: int = 15) -> dict:
     """Nearest-vehicle greedy matching — also used as an evaluation baseline."""
+    clean_stops = _valid_stops(stops)
+    depot_pt = (float(depot[0]), float(depot[1]))
     routes = []
-    remaining = sorted(stops, key=lambda s: -(s.get("demand_kg") or 0))
-    for v in vehicles:
-        cap = float(v["capacity_kg"])
+    remaining = sorted(clean_stops, key=lambda s: -(float(s.get("demand_kg") or 0)))
+    for v_idx, v in enumerate(vehicles or []):
+        cap = float(v.get("capacity_kg") or 7500)
+        v_class = v.get("class") or "lcv"
         load, seq, km = 0.0, [], 0.0
-        cur = depot
+        cur = depot_pt
         while remaining:
             cand = min(remaining, key=lambda s: road_km(cur[0], cur[1], s["lat"], s["lng"]))
             d = road_km(cur[0], cur[1], cand["lat"], cand["lng"])
-            if load + (cand.get("demand_kg") or 0) > cap:
-                # try next best that still fits
-                fits = [s for s in remaining if load + (s.get("demand_kg") or 0) <= cap]
+            cand_kg = float(cand.get("demand_kg") or 0)
+            if load + cand_kg > cap:
+                fits = [s for s in remaining if load + float(s.get("demand_kg") or 0) <= cap]
                 if not fits:
                     break
                 cand = min(fits, key=lambda s: road_km(cur[0], cur[1], s["lat"], s["lng"]))
                 d = road_km(cur[0], cur[1], cand["lat"], cand["lng"])
-            load += cand.get("demand_kg") or 0
+                cand_kg = float(cand.get("demand_kg") or 0)
+            load += cand_kg
             km += d
             seq.append(cand)
             remaining.remove(cand)
             cur = (cand["lat"], cand["lng"])
         if seq:
             eta, t = [], 0
-            pts = [depot] + [(s["lat"], s["lng"]) for s in seq]
+            pts = [depot_pt] + [(s["lat"], s["lng"]) for s in seq]
             for a, b in zip(pts, pts[1:]):
-                t += travel_minutes(v["class"], road_km(a[0], a[1], b[0], b[1])) + 15
+                t += travel_minutes(v_class, road_km(a[0], a[1], b[0], b[1])) + service_min
                 eta.append(t)
             routes.append({
-                "vehicle_id": v["id"], "vehicle_class": v["class"],
+                "vehicle_id": v.get("id") or f"VEH-{v_idx + 1}",
+                "vehicle_class": v_class,
                 "stops": [{**{k: s[k] for k in ("id", "name") if k in s}, "lat": s["lat"], "lng": s["lng"],
                            "demand_kg": s.get("demand_kg", 0), "eta_min": eta[i]} for i, s in enumerate(seq)],
-                "distance_km": round(km, 2), "load_kg": round(load, 1),
-                "capacity_kg": cap, "load_factor": round(load / cap, 3),
+                "distance_km": round(km, 2),
+                "load_kg": round(load, 1),
+                "capacity_kg": cap,
+                "load_factor": round(load / cap, 3),
                 "cost": round(km * float(v.get("cost_per_km") or 20), 2),
             })
     return _summarise(routes, remaining, "greedy_nearest_vehicle", 0)
@@ -260,58 +326,67 @@ def greedy_routes(*, depot, stops, vehicles) -> dict:
 def build_two_echelon(*, pickups: list[dict], hub: dict | None, line_haul_vehicle: dict,
                       destination: dict, first_mile_vehicle: dict) -> dict:
     """pickups -> hub (small vehicle) -> destination (large vehicle)."""
-    if not pickups:
+    clean_pickups = _valid_stops(pickups)
+    if not clean_pickups:
         return {"mode": "none", "legs": []}
-    if hub is None:
-        # direct single-echelon trip
+
+    dest_coords = _coords(destination) or (30.704, 76.223)
+    dest_name = (destination or {}).get("name") or "Destination"
+    hub_coords = _coords(hub)
+
+    if hub is None or hub_coords is None:
         return {
             "mode": "direct",
             "legs": [
                 {
                     "leg_type": "direct",
-                    "vehicle_id": line_haul_vehicle["id"],
-                    "vehicle_class": line_haul_vehicle["class"],
-                    "stops": [p["name"] for p in pickups] + [destination["name"]],
-                    "distance_km": _tsp_distance([(p["lat"], p["lng"]) for p in pickups], (destination["lat"], destination["lng"])),
+                    "vehicle_id": line_haul_vehicle.get("id") or "VEH-LH",
+                    "vehicle_class": line_haul_vehicle.get("class") or "lcv",
+                    "stops": [p["name"] for p in clean_pickups] + [dest_name],
+                    "distance_km": _tsp_distance([(p["lat"], p["lng"]) for p in clean_pickups], dest_coords),
                     "note": "No approved hub available — direct collection and line-haul.",
                 }
             ],
         }
 
+    hub_name = hub.get("name") or "Hub"
     fm = plan_routes(
-        depot=(hub["lat"], hub["lng"]),
-        stops=[{**p, "demand_kg": p.get("demand_kg", 0)} for p in pickups],
+        depot=hub_coords,
+        stops=[{**p, "demand_kg": float(p.get("demand_kg") or 0)} for p in clean_pickups],
         vehicles=[first_mile_vehicle],
         horizon_min=420,
     )
-    total_kg = sum(p.get("demand_kg", 0) for p in pickups)
-    lh_km = road_km(hub["lat"], hub["lng"], destination["lat"], destination["lng"])
+    total_kg = sum(float(p.get("demand_kg") or 0) for p in clean_pickups)
+    lh_km = road_km(hub_coords[0], hub_coords[1], dest_coords[0], dest_coords[1])
+    lh_class = line_haul_vehicle.get("class") or "lcv"
+    fm_class = first_mile_vehicle.get("class") or "tractor_trolley"
+
     legs = [
         {
             "leg_type": "first_mile",
-            "vehicle_id": first_mile_vehicle["id"],
-            "vehicle_class": first_mile_vehicle["class"],
-            "stops": [p["name"] for p in pickups] + [hub["name"]],
+            "vehicle_id": first_mile_vehicle.get("id") or "VEH-FM",
+            "vehicle_class": fm_class,
+            "stops": [p["name"] for p in clean_pickups] + [hub_name],
             "distance_km": fm["total_km"],
-            "transfer_window": f"T+{int(fm['routes'][0]['stops'][-1]['eta_min']) if fm['routes'] and fm['routes'][0]['stops'] else 90} min",
+            "transfer_window": f"T+{int(fm['routes'][0]['stops'][-1]['eta_min']) if fm.get('routes') and fm['routes'][0].get('stops') else 90} min",
             "load_kg": total_kg,
         },
         {
             "leg_type": "line_haul",
-            "vehicle_id": line_haul_vehicle["id"],
-            "vehicle_class": line_haul_vehicle["class"],
-            "stops": [hub["name"], destination["name"]],
+            "vehicle_id": line_haul_vehicle.get("id") or "VEH-LH",
+            "vehicle_class": lh_class,
+            "stops": [hub_name, dest_name],
             "distance_km": lh_km,
-            "eta_min": travel_minutes(line_haul_vehicle["class"], lh_km),
+            "eta_min": travel_minutes(lh_class, lh_km),
             "load_kg": total_kg,
-            "capacity_kg": CLASS_CAPACITY_KG.get(line_haul_vehicle["class"], 7500),
+            "capacity_kg": CLASS_CAPACITY_KG.get(lh_class, 7500),
         },
     ]
     line_haul_fit = total_kg <= legs[1]["capacity_kg"]
     return {
         "mode": "two_echelon",
         "legs": legs,
-        "hub": {"id": hub["id"], "name": hub["name"], "safety_verified": hub.get("safety_verified")},
+        "hub": {"id": hub.get("id"), "name": hub_name, "safety_verified": hub.get("safety_verified")},
         "line_haul_feasible": line_haul_fit,
         "transfer_wait_min": 25,
         "total_km": round(fm["total_km"] + lh_km, 2),
@@ -334,18 +409,27 @@ def _tsp_distance(stops: list[tuple[float, float]], dest: tuple[float, float]) -
 
 def road_access_check(edges: list[dict], vehicle_class: str, monsoon: bool = False) -> dict:
     blocked, warnings = [], []
-    for e in edges:
+    for i, e in enumerate(edges or []):
         classes = allowed_classes(e.get("surface") or "paved", float(e.get("width_m") or 6))
+        edge_id = e.get("id") or f"EDGE-{i + 1}"
         if vehicle_class not in classes:
-            blocked.append({"edge": e["id"], "from": e["from_node"], "to": e["to_node"],
-                            "reason": f"{e.get('surface')} surface / {e.get('width_m')} m width excludes {vehicle_class}"})
+            blocked.append({
+                "edge": edge_id,
+                "from": e.get("from_node"),
+                "to": e.get("to_node"),
+                "reason": f"{e.get('surface')} surface / {e.get('width_m')} m width excludes {vehicle_class}",
+            })
         elif monsoon and float(e.get("monsoon_risk") or 0) > 0.45:
-            warnings.append({"edge": e["id"], "reason": "high monsoon waterlogging risk", "risk": e["monsoon_risk"]})
+            warnings.append({
+                "edge": edge_id,
+                "reason": "high monsoon waterlogging risk",
+                "risk": e.get("monsoon_risk"),
+            })
     return {
         "vehicle_class": vehicle_class,
         "monsoon_mode": monsoon,
         "blocked": blocked,
         "warnings": warnings,
         "passable": not blocked,
-        "checked_edges": len(edges),
+        "checked_edges": len(edges or []),
     }
