@@ -11,6 +11,8 @@ NOW = lambda: datetime.now(timezone.utc).isoformat()
 
 
 def uid(prefix: str) -> str:
+    if (db.dialect() or "").lower() in ("postgres", "postgresql"):
+        return str(uuid.uuid4())
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
